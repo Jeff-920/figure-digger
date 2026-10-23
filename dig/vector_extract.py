@@ -103,6 +103,42 @@ def _inside(b, x, y, tol=0.0):
     return b[0] - tol <= x <= b[2] + tol and b[1] - tol <= y <= b[3] + tol
 
 
+def find_axes_boxes(page, bbox):
+    """Independent PDF plot frames; never calibrate their union as one coordinate system."""
+    bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    boxes = []
+    for rc in page.rects:
+        b = (rc["x0"], rc["top"], rc["x1"], rc["bottom"])
+        if (_inside(bbox, b[0], b[1], 1) and _inside(bbox, b[2], b[3], 1)
+                and b[2] - b[0] > .2 * bw and b[3] - b[1] > .15 * bh):
+            boxes.append(b)
+    horizontal, vertical = [], []
+    for ln in page.lines:
+        b = (ln["x0"], ln["top"], ln["x1"], ln["bottom"])
+        if not (_inside(bbox, b[0], b[1], 1) and _inside(bbox, b[2], b[3], 1)):
+            continue
+        if abs(b[3] - b[1]) <= .5 and b[2] - b[0] > .2 * bw:
+            horizontal.append(b)
+        if abs(b[2] - b[0]) <= .5 and b[3] - b[1] > .15 * bh:
+            vertical.append(b)
+    for l in vertical:
+        for h in horizontal:
+            if abs(l[0] - h[0]) <= 1 and abs(l[3] - h[1]) <= 1:
+                boxes.append((l[0], l[1], h[2], h[1]))
+    unique = []
+    for b in sorted(boxes, key=_bbox_area):
+        if any(max(abs(x - y) for x, y in zip(b, k)) < 2 for k in unique):
+            continue
+        inside = [k for k in unique if _inside(b, k[0], k[1]) and _inside(b, k[2], k[3])]
+        if len(inside) >= 2:
+            continue
+        if any(_bbox_area((max(b[0], k[0]), max(b[1], k[1]), min(b[2], k[2]), min(b[3], k[3])))
+               > .2 * min(_bbox_area(b), _bbox_area(k)) for k in unique):
+            continue
+        unique.append(b)
+    return sorted(unique, key=lambda b: (b[1], b[0]))
+
+
 def find_axes_box(page, bbox, min_frac=0.45):
     """The largest axis-aligned rectangle inside the region is the plot frame."""
     best = None
@@ -274,7 +310,11 @@ def _color_key(c):
             and (not c.get("stroke") or chroma(fill_col) > chroma(stroke_col)):
         col = fill_col
     else:
-        col = stroke_col or fill_col
+        col = stroke_col if stroke_col is not None else fill_col
+    if isinstance(col,(int,float)):
+        return (round(float(col),2),)*3
+    if isinstance(col,(list,tuple)) and len(col)==1:
+        return (round(float(col[0]),2),)*3
     if isinstance(col, (list, tuple)) and len(col) == 3:
         return tuple(round(float(v), 2) for v in col)
     return None
@@ -304,7 +344,8 @@ def _dedupe_points(points, tol=1e-6):
     return out
 
 
-def _vector_candidates(page, axes, min_pts=6, min_extent_frac=0.15):
+def _vector_candidates(page, axes, min_pts=6, min_extent_frac=0.15,
+                       retain_markers=False, exclude_boxes=()):
     """Return physical vector instances instead of merging everything by colour.
 
     A single colour may represent several experimental holes/conditions.  Each long
@@ -315,9 +356,11 @@ def _vector_candidates(page, axes, min_pts=6, min_extent_frac=0.15):
     fw, fh = max(1.0, right - left), max(1.0, bottom - top)
     candidates = []
     long_colors = set()
+    def excluded(x,y):
+        return any(_inside(b,x,y) for b in exclude_boxes)
     for object_index, c in enumerate(list(page.curves) + list(page.lines)):
         pts = c.get("pts") or [(c["x0"], c["top"]), (c["x1"], c["bottom"])]
-        inside = _dedupe_points((x, y) for (x, y) in pts if _inside(axes, x, y))
+        inside = _dedupe_points((x, y) for (x, y) in pts if _inside(axes, x, y) and not excluded(x,y))
         if len(inside) < min_pts:
             continue
         xs = [p[0] for p in inside]
@@ -328,28 +371,52 @@ def _vector_candidates(page, axes, min_pts=6, min_extent_frac=0.15):
                            "object_index": object_index})
         long_colors.add(key)
 
-    # Marker-only curves: circles are curves with Bezier commands, squares are PDF
-    # rects.  Do not emit a second marker series when a real polyline of that colour
-    # already exists; the markers are then merely samples drawn on top of the line.
+    # A semantic inventory can require both marker data and a same-colour model
+    # path. Without an inventory, retain the legacy avoidance of duplicate samples.
     marker_groups = defaultdict(list)
     for c in page.curves:
         key = _color_key(c) or ("?",)
-        if key in long_colors:
+        if key in long_colors and not retain_markers:
             continue
         cx, cy = (c["x0"] + c["x1"]) / 2.0, (c["top"] + c["bottom"]) / 2.0
         w, h = c["x1"] - c["x0"], c["bottom"] - c["top"]
-        if not _inside(axes, cx, cy) or not (0.3 <= w <= 0.05 * fw and 0.3 <= h <= 0.08 * fh):
+        if not _inside(axes, cx, cy) or excluded(cx,cy) or not (0.3 <= w <= 0.05 * fw and 0.3 <= h <= 0.08 * fh):
             continue
         path = c.get("path") or []
-        shape = "circle" if any(cmd and cmd[0] == "c" for cmd in path) else "glyph"
+        commands = [cmd[0] for cmd in path if cmd]
+        if retain_markers:
+            # Outlined fonts are also PDF curves. Marker primitives have simple
+            # one-subpath geometry; a many-Bezier letter is not a data glyph.
+            if commands.count('m') > 1 or commands.count('c') not in (0,4):
+                continue
+            if not (.45 <= w/max(h,1e-6) <= 2.2):
+                continue
+            vertices = _dedupe_points(c.get('pts') or [])
+            if vertices and vertices[0] == vertices[-1]:
+                vertices = vertices[:-1]
+            if commands.count('c') == 4:
+                shape = 'circle'
+            elif len(vertices) == 3:
+                shape = 'triangle'
+                cx,cy = sum(x for x,y in vertices)/3.,sum(y for x,y in vertices)/3.
+            elif len(vertices) == 4:
+                shape = 'diamond' if all(abs(x-cx)<.2*w or abs(y-cy)<.2*h
+                                         for x,y in vertices) else 'rect'
+            elif len(vertices) == 10:
+                shape = 'star'
+                cx,cy = sum(x for x,y in vertices)/10.,sum(y for x,y in vertices)/10.
+            else:
+                continue
+        else:
+            shape = "circle" if any(cmd and cmd[0] == "c" for cmd in path) else "glyph"
         marker_groups[(key, shape)].append((cx, cy))
     for c in page.rects:
         key = _color_key(c) or ("?",)
-        if key in long_colors:
+        if key in long_colors and not retain_markers:
             continue
         cx, cy = (c["x0"] + c["x1"]) / 2.0, (c["top"] + c["bottom"]) / 2.0
         w, h = c["x1"] - c["x0"], c["bottom"] - c["top"]
-        if not _inside(axes, cx, cy) or not (0.3 <= w <= 0.05 * fw and 0.3 <= h <= 0.08 * fh):
+        if not _inside(axes, cx, cy) or excluded(cx,cy) or not (0.3 <= w <= 0.05 * fw and 0.3 <= h <= 0.08 * fh):
             continue
         marker_groups[(key, "rect")].append((cx, cy))
     shaped_colors = {key for (key, shape), pts in marker_groups.items()
@@ -366,6 +433,51 @@ def _vector_candidates(page, axes, min_pts=6, min_extent_frac=0.15):
                                "source": f"markers:{shape}", "object_index": 0})
 
     return candidates
+
+
+def snap_axes(page, axes):
+    """Snap an independently calibrated panel frame to nearby exact PDF spines.
+
+    The panel identity has already been established in the rendered image. A
+    smaller legend rectangle must never replace it through global box ranking.
+    """
+    left,top,right,bottom = map(float,axes)
+    fw,fh = right-left,bottom-top
+    out = [left,top,right,bottom]
+    for index,target in enumerate(out):
+        choices = []
+        for line in page.lines:
+            x0,x1,y0,y1 = line['x0'],line['x1'],line['top'],line['bottom']
+            if index in (0,2):
+                if abs(x1-x0)>.05 or min(bottom,y1)-max(top,y0)<.85*fh:
+                    continue
+                pos,tol = (x0+x1)/2.,.025*fw
+            else:
+                if abs(y1-y0)>.05 or min(right,x1)-max(left,x0)<.85*fw:
+                    continue
+                pos,tol = (y0+y1)/2.,.025*fh
+            if abs(pos-target)<=tol:
+                choices.append((abs(pos-target),pos))
+        if choices:
+            out[index] = min(choices)[1]
+    return out
+
+
+def inner_exclusions(page, axes):
+    """Exact stroked legend/inset rectangles wholly inside one panel's axes."""
+    left,top,right,bottom = axes
+    fw,fh = right-left,bottom-top
+    boxes = []
+    for rect in page.rects:
+        box = [rect['x0'],rect['top'],rect['x1'],rect['bottom']]
+        w,h = box[2]-box[0],box[3]-box[1]
+        key = _color_key(rect)
+        if (rect.get('stroke') and key and len(key)==3 and max(key)-min(key)<.1
+                and max(key)<.5 and left<box[0]<box[2]<right
+                and top<box[1]<box[3]<bottom
+                and .1*fw<w<.92*fw and .07*fh<h<.92*fh):
+            boxes.append(box)
+    return boxes
 
 
 def _spec_distance(candidate, spec, image_bbox):
@@ -396,10 +508,24 @@ def _assign_specs(candidates, series_spec, image_bbox):
         skey = _hex_key(spec.get("color"))
         ranked = []
         for i in unused:
+            source = candidates[i]['source']
+            draw = str(spec.get('draw') or '')
+            if (draw in ('markers_only','markers_connected') and not source.startswith('markers:')) \
+                    or (draw == 'line_only' and source.startswith('markers:')):
+                continue
+            shape = str(spec.get('marker_shape') or '')
+            required_shape = {'square':'rect','diamond':'diamond','triangle':'triangle','circle':'circle','star':'star'}.get(shape)
+            if source.startswith('markers:') and required_shape and source.split(':')[1] != required_shape:
+                continue
             ckey = candidates[i]["color_key"]
             color_penalty = 0.0
             if skey is not None and ckey != skey:
-                color_penalty = 0.35
+                if len(ckey) == 3:
+                    sh = ss._hsv_of(tuple(round(255*v) for v in skey[::-1]))
+                    ch = ss._hsv_of(tuple(round(255*v) for v in ckey[::-1]))
+                    color_penalty = .03 if sh[1]>40 and ch[1]>40 and ss._hue_dist(sh[0],ch[0])<=32 else .35
+                else:
+                    color_penalty = .35
             ranked.append((_spec_distance(candidates[i], spec, image_bbox) + color_penalty, i))
         if not ranked:
             continue
@@ -413,16 +539,18 @@ def _assign_specs(candidates, series_spec, image_bbox):
         candidates[best]["spec_index"] = spec_index
         candidates[best]["anchor_score"] = round(score, 4)
         ordered.append(candidates[best])
-    ordered.extend(candidates[i] for i in sorted(unused))
+    if not series_spec:
+        ordered.extend(candidates[i] for i in sorted(unused))
     return ordered
 
 
 def extract_series(page, axes, xcal, ycal, min_pts=6, min_extent_frac=0.15,
-                   series_spec=None, image_bbox=None):
+                   series_spec=None, image_bbox=None, exclude_boxes=()):
     """Map every physical vector path/marker track into data coordinates."""
     candidates = _vector_candidates(page, axes, min_pts=min_pts,
-                                    min_extent_frac=min_extent_frac)
-    candidates = _assign_specs(candidates, series_spec or [], image_bbox or axes)
+                                    min_extent_frac=min_extent_frac,
+                                    retain_markers=bool(series_spec),exclude_boxes=exclude_boxes)
+    candidates = _assign_specs(candidates, series_spec or [], axes)
 
     out = []
     for cand in candidates:
@@ -442,6 +570,7 @@ def extract_series(page, axes, xcal, ycal, min_pts=6, min_extent_frac=0.15,
             "x_range": [min(d[0] for d in data), max(d[0] for d in data)],
             "y_range": [min(d[1] for d in data), max(d[1] for d in data)],
             "series_name": cand.get("series_name"),
+            "spec_index": cand.get("spec_index"),
             "source": cand.get("source"),
             "anchor_score": cand.get("anchor_score"),
             "data": data,
@@ -455,6 +584,10 @@ def _safe_tag(text, limit=48):
 
 
 def extract_vector_figure(page, bbox, outdir=None, name="vec", series_spec=None):
+    frames = find_axes_boxes(page, bbox)
+    if len(frames) > 1:
+        return {"error": "multiple independent plot frames", "bbox": bbox,
+                "axes_boxes": frames, "series": []}
     axes = find_axes_box(page, bbox)
     if axes is None:
         return {"error": "no axes frame found", "bbox": bbox}

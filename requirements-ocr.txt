@@ -1,0 +1,3 @@
+# 可选刻度 OCR；pip 会安装其 ONNX Runtime 等依赖。
+# 仅使用视觉模型（--vlm --no-ocr）时无需安装。
+rapidocr-onnxruntime>=1.3

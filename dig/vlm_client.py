@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import time
+from threading import RLock
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -45,6 +46,7 @@ CACHE_DIR = ROOT / ".vlm_cache"
 LOG_PATH = ROOT / ".vlm_log.jsonl"
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_SIDE = 2000
+_FILE_LOCK = RLock()
 
 
 class VLMError(RuntimeError):
@@ -90,14 +92,22 @@ def prepare_image(image_path):
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     data = buf.getvalue()
+    mime = "image/png"
     if len(data) > MAX_IMAGE_BYTES:
         img.save(buf := io.BytesIO(), format="JPEG", quality=88)
         data = buf.getvalue()
+        mime = "image/jpeg"
     digest = hashlib.sha256(data).hexdigest()
-    return "data:image/png;base64," + base64.b64encode(data).decode("ascii"), digest
+    return f"data:{mime};base64," + base64.b64encode(data).decode("ascii"), digest
 
 
 class DeepSeekVLM:
+    def fork(self):
+        """Independent request state; usage is merged by the coordinating thread."""
+        return DeepSeekVLM(api_key=self.api_key, base_url=self.base_url, model=self.model,
+                           timeout=self.timeout, cache=self.use_cache, log=self.use_log,
+                           verbose=self.verbose, thinking=self.thinking)
+
     def __init__(self, api_key=None, base_url=None, model=None, timeout=120,
                  cache=True, log=True, verbose=False, thinking=False):
         self.api_key = load_api_key(api_key)
@@ -116,6 +126,7 @@ class DeepSeekVLM:
                       "reasoning_tokens": 0}
         self.last_usage = {}
         self.last_model = None
+        self.last_finish_reason = None
 
     # ---------- low level ----------
     def _post(self, path, payload):
@@ -196,15 +207,21 @@ class DeepSeekVLM:
             retries=1, temperature=0.0):
         # image_path=None -> text-only request (used by the figure selector's
         # shortlist pass); everything else below - cache, log, usage - is shared.
-        data_uri, digest = (None, "text-only") if image_path is None else prepare_image(image_path)
+        paths = list(image_path) if isinstance(image_path, (list, tuple)) else \
+            ([] if image_path is None else [image_path])
+        prepared = [prepare_image(path) for path in paths]
+        digest = prepared[0][1] if len(prepared) == 1 else \
+            (hashlib.sha256("|".join(p[1] for p in prepared).encode()).hexdigest()
+             if prepared else "text-only")
         cache_key = self._cache_key(
             digest, prompt, system, json_mode, max_tokens, temperature)
         cache_file = CACHE_DIR / f"{cache_key}.json"
         if self.use_cache and cache_file.exists():
             self.usage["cache_hits"] += 1
-            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            with _FILE_LOCK:
+                cached = json.loads(cache_file.read_text(encoding="utf-8"))
             if self.use_log:
-                with LOG_PATH.open("a", encoding="utf-8") as fh:
+                with _FILE_LOCK, LOG_PATH.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps({
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "requested_model": self.model, "response_model": None,
@@ -219,7 +236,7 @@ class DeepSeekVLM:
         if system:
             messages.append({"role": "system", "content": system})
         blocks = [{"type": "text", "text": prompt}]
-        if data_uri:
+        for data_uri, _image_digest in prepared:
             blocks.append({"type": "image_url", "image_url": {"url": data_uri}})
         messages.append({"role": "user", "content": blocks})
         payload = self._payload(messages, json_mode=json_mode, max_tokens=max_tokens,
@@ -238,6 +255,7 @@ class DeepSeekVLM:
                 raise
             content = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
             finish = (resp.get("choices") or [{}])[0].get("finish_reason")
+            self.last_finish_reason = finish
             usage = resp.get("usage") or {}
             self.last_usage = usage
             self.last_model = resp.get("model") or self.model
@@ -251,7 +269,7 @@ class DeepSeekVLM:
             self.usage["reasoning_tokens"] += int(
                 (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0)
             if self.use_log:
-                with LOG_PATH.open("a", encoding="utf-8") as fh:
+                with _FILE_LOCK, LOG_PATH.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps({
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "requested_model": self.model,
@@ -265,10 +283,17 @@ class DeepSeekVLM:
                         "finish_reason": finish, "thinking": self.thinking,
                     }, ensure_ascii=False) + "\n")
             if content.strip() or attempt >= retries:
-                if self.use_cache:
+                cacheable = finish != "length"
+                if json_mode:
+                    try:
+                        parse_json_loose(content)
+                    except (ValueError, TypeError):
+                        cacheable = False
+                if self.use_cache and cacheable:
                     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                    cache_file.write_text(json.dumps({"content": content}, ensure_ascii=False),
-                                          encoding="utf-8")
+                    with _FILE_LOCK:
+                        cache_file.write_text(json.dumps({"content": content}, ensure_ascii=False),
+                                              encoding="utf-8")
                 if not content.strip():
                     if finish == "length":
                         last_err = VLMError(
@@ -284,8 +309,19 @@ class DeepSeekVLM:
 
     def ask_json(self, image_path, prompt, system=None, **kw):
         """ask() + robust JSON parsing (models sometimes wrap it in code fences)."""
-        raw = self.ask(image_path, prompt, system=system, json_mode=True, **kw)
-        return parse_json_loose(raw), raw
+        budget = int(kw.pop("max_tokens", 1024))
+        for attempt in range(3):
+            raw = self.ask(image_path, prompt, system=system, json_mode=True,
+                           max_tokens=budget, **kw)
+            try:
+                return parse_json_loose(raw), raw
+            except (ValueError, TypeError) as exc:
+                if attempt == 2:
+                    raise VLMError(f"模型未返回完整合法 JSON（max_tokens={budget}）：{exc}") from exc
+                # Large multi-panel plans may exhaust the ordinary task budget.
+                # Retry with a different cache key and a bounded output allowance.
+                budget = min(32768, budget * 2)
+        raise VLMError("模型未返回完整合法 JSON")
 
     def ask_text(self, prompt, max_tokens=16):
         """Text-only request; used by --probe to reveal the serving model and usage."""

@@ -20,6 +20,7 @@ from pathlib import Path
 import cv2
 import imgio as iio
 import numpy as np
+from detection_cache import cached_detection
 
 for stream in (sys.stdout, sys.stderr):
     try:
@@ -30,19 +31,16 @@ for stream in (sys.stdout, sys.stderr):
 
 def longest_run(mask_1d):
     """Length and start index of the longest True run."""
-    best_len, best_start, cur_start = 0, -1, None
-    for i, v in enumerate(mask_1d):
-        if v:
-            if cur_start is None:
-                cur_start = i
-        else:
-            if cur_start is not None:
-                if i - cur_start > best_len:
-                    best_len, best_start = i - cur_start, cur_start
-                cur_start = None
-    if cur_start is not None and len(mask_1d) - cur_start > best_len:
-        best_len, best_start = len(mask_1d) - cur_start, cur_start
-    return best_len, best_start
+    mask = np.asarray(mask_1d, dtype=bool)
+    padded = np.empty(mask.size + 2, dtype=bool)
+    padded[0] = padded[-1] = False
+    padded[1:-1] = mask
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    if not edges.size:
+        return 0, -1
+    lengths = edges[1::2] - edges[::2]
+    index = int(lengths.argmax())  # Preserve the first run when lengths tie.
+    return int(lengths[index]), int(edges[2 * index])
 
 
 def _line_candidates(runs, length, thresh, group_gap=3):
@@ -70,7 +68,27 @@ def _box_edges_dark(dark, box, min_cover=0.6):
     return cover >= min_cover
 
 
-def find_boxes(gray, dark_thresh=120, min_run_frac=0.4, min_frac=0.22):
+def rectangle_edge_extensions(gray, box, dark_thresh=245):
+    """Count sides continuing outside a rectangle, typical of grid intersections."""
+    x,y,right,bottom = map(int,box)
+    rows,cols = gray.shape
+    distance = max(12,int(.04*min(right-x,bottom-y)))
+    ink = gray<dark_thresh
+    def horizontal(yy):
+        band = ink[max(0,yy-1):min(rows,yy+2)]
+        parts = [band[:,max(0,x-distance):max(0,x-3)],
+                 band[:,min(cols,right+4):min(cols,right+distance)]]
+        return any(p.shape[1]>=6 and p.any(axis=0).mean()>=.75 for p in parts)
+    def vertical(xx):
+        band = ink[:,max(0,xx-1):min(cols,xx+2)]
+        parts = [band[max(0,y-distance):max(0,y-3)],
+                 band[min(rows,bottom+4):min(rows,bottom+distance)]]
+        return any(p.shape[0]>=6 and p.any(axis=1).mean()>=.75 for p in parts)
+    return sum((horizontal(y),horizontal(bottom),vertical(x),vertical(right)))
+
+
+@cached_detection
+def find_boxes(gray, dark_thresh=120, min_run_frac=0.4, min_frac=0.22, keep_nested=False):
     """Every rectangle whose four edges are long straight dark lines, largest first.
 
     The axes box, a legend frame and a zoom inset are all built from the same kind of
@@ -101,6 +119,8 @@ def find_boxes(gray, dark_thresh=120, min_run_frac=0.4, min_frac=0.22):
                     if _box_edges_dark(dark, (left, top, right, bottom)):
                         boxes.append((left, top, right, bottom))
     boxes.sort(key=lambda b: -((b[2] - b[0]) * (b[3] - b[1])))
+    if keep_nested:
+        return boxes
     # 只保留最大的那些：被别的框包住的（嵌套边框、图例框）丢掉
     out = []
     for b in boxes:
@@ -442,7 +462,7 @@ def color_mask(hsv, frame, target_bgr, hue_tol=14, sat_frac=0.45, min_sat=45,
     dh = np.abs(hue - th)
     dh = np.minimum(dh, 180 - dh)
     mask = ((dh <= hue_tol) & (sat >= max(min_sat, sat_frac * ts)) & (val >= val_frac * tv))
-    return _clip_and_mask(mask.astype(np.uint8) * 255, frame, boxes)
+    return _clip_and_mask(mask.astype(np.uint8) * 255, frame, boxes,clean_ring=False)
 
 
 def trace_hue_instances(hsv, frame, hue_center, hue_tol=14, sat_min=70, val_min=40,
@@ -455,12 +475,13 @@ def trace_hue_instances(hsv, frame, hue_center, hue_tol=14, sat_min=70, val_min=
     dh = np.abs(hue - hue_center)
     dh = np.minimum(dh, 180 - dh)
     mask = ((dh <= hue_tol) & (sat >= sat_min) & (val >= val_min)).astype(np.uint8) * 255
-    mask = _clip_and_mask(mask, frame, legend_boxes)
+    mask = _clip_and_mask(mask, frame, legend_boxes,clean_ring=False)
     return _instances_from_mask(mask, frame, max_instances, min_points, min_span,
                                 erase_width)
 
 
-def dark_mask(gray, frame, exclude_boxes=(), dark_thresh=100, line_frac=0.55):
+def dark_mask(gray, frame, exclude_boxes=(), dark_thresh=100, line_frac=0.55, source_img=None,
+              clean_ring=True):
     """Dark pixels that are line-like: no plot frame, no grid, no tick labels.
 
     Black data lines were skipped by design because "black" also means the axes, the
@@ -472,7 +493,15 @@ def dark_mask(gray, frame, exclude_boxes=(), dark_thresh=100, line_frac=0.55):
     """
     left, top, right, bottom = frame
     mask = (gray < dark_thresh).astype(np.uint8) * 255
-    mask = _clip_and_mask(mask, frame, exclude_boxes)
+    if source_img is not None:
+        # A red or blue stroke can be darker than the grayscale threshold. Black
+        # identity requires low chroma, including anti-aliased gray edge pixels.
+        hsv = cv2.cvtColor(source_img, cv2.COLOR_BGR2HSV)
+        # JPEG near-black pixels can have high relative HSV saturation while
+        # their channels differ by only 2-10 levels. Keep these black glyph cores.
+        chroma = source_img.max(axis=2).astype(int) - source_img.min(axis=2).astype(int)
+        mask[(hsv[:,:,1] > 80) & (chroma > 25)] = 0
+    mask = _clip_and_mask(mask, frame, exclude_boxes, clean_ring=clean_ring)
     if right - left < 10 or bottom - top < 10:
         return mask
     inside = mask[top + 2:bottom - 1, left + 2:right - 1]
@@ -518,7 +547,7 @@ def _median_run_len(mask, pts):
     return float(np.median(lens)) if lens else 0.0
 
 
-def _clip_and_mask(mask, frame, exclude_boxes):
+def _clip_and_mask(mask, frame, exclude_boxes,clean_ring=True):
     left, top, right, bottom = frame
     mask[:top + 2, :] = 0
     mask[bottom:, :] = 0
@@ -528,6 +557,11 @@ def _clip_and_mask(mask, frame, exclude_boxes):
     for box in exclude_boxes:
         x, y, w, h = (int(v) for v in box[:4])
         mask[max(0, y - 3):y + h + 3, max(0, x - 3):x + w + 3] = 0
+        if not clean_ring:
+            # Saturated colour masks do not contain ordinary inset tick text.
+            # Small coloured components outside the box may be actual data
+            # markers; their size alone cannot justify removing them.
+            continue
         # 图例框 / 放大子图的**刻度文字**常画在框外一圈（inset 的 70/60/50 就标在
         # 框左边约 40px 处），只清框内救不了它们。所以再清掉框周围一圈里的
         # 小碎块——只删小块（文字/刻度），细长的线段一律保留。

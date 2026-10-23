@@ -65,7 +65,7 @@ def nice_ticks(lo, hi, count=5):
     return [lo + i * step for i in range(count)]
 
 
-def draw_plot(canvas, box, series, xr, yr, xlabel, ylabel):
+def draw_plot(canvas, box, series, xr, yr, xlabel, ylabel, styles=None):
     left, top, right, bottom = box
     xmin, xmax = xr
     ymin, ymax = yr
@@ -93,17 +93,20 @@ def draw_plot(canvas, box, series, xr, yr, xlabel, ylabel):
             px = int(round(left + (x - xmin) / (xmax - xmin) * (right - left)))
             py = int(round(bottom - (y - ymin) / (ymax - ymin) * (bottom - top)))
             pts.append((px, py))
-        if len(pts) > 1:
+        if (styles or {}).get(label) == "points":
+            for point in pts:
+                cv2.circle(canvas,point,3,color,1,cv2.LINE_AA)
+        elif len(pts) > 1:
             cv2.polylines(canvas, [np.array(pts, np.int32)], False, color, 1, cv2.LINE_AA)
         cv2.line(canvas, (right - 210, legend_y), (right - 180, legend_y), color, 2)
-        cv2.putText(canvas, label, (right - 175, legend_y + 5),
+        cv2.putText(canvas, label[:32], (right - 175, legend_y + 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
         legend_y += 20
 
 
 def compose_overlay(image_path, frame, xrange, yrange, series, out_path,
                     xlabel="x", ylabel="y", annotations=None, anchors=None,
-                    bridged=None):
+                    bridged=None, styles=None):
     """Build the two-panel QA image: left = points reprojected on the figure,
     right = the extracted data replotted.
 
@@ -136,7 +139,8 @@ def compose_overlay(image_path, frame, xrange, yrange, series, out_path,
             px = int(round(left + (x - xmin) / (xmax - xmin) * (right - left)))
             py = int(round(bottom - (y - ymin) / (ymax - ymin) * (bottom - top)))
             if 0 <= px < img.shape[1] and 0 <= py < img.shape[0]:
-                cv2.circle(img, (px, py), 1, color, -1)
+                is_point = (styles or {}).get(label) == "points"
+                cv2.circle(img, (px, py), 3 if is_point else 1, color, 1 if is_point else -1)
 
     for x, y, label in (anchors or []):
         x, y = int(round(x)), int(round(y))
@@ -167,7 +171,7 @@ def compose_overlay(image_path, frame, xrange, yrange, series, out_path,
     canvas = np.full((canvas_h, w + 60 + panel_w, 3), 255, np.uint8)
     canvas[10:10 + h, 10:10 + w] = img
     box = (w + 90, 70, w + 60 + panel_w, min(canvas_h - 80, 600))
-    draw_plot(canvas, box, loaded, (xmin, xmax), (ymin, ymax), xlabel, ylabel)
+    draw_plot(canvas, box, loaded, (xmin, xmax), (ymin, ymax), xlabel, ylabel, styles=styles)
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)

@@ -57,6 +57,7 @@ class Handler(BaseHTTPRequestHandler):
                          "json_mode": "response_format" in payload,
                          "thinking": payload.get("thinking"),
                          "has_image": has_image, "data_uri_prefix": data_uri[:30],
+                         "image_count": sum(b.get('type') == 'image_url' for b in content),
                          "prompt": text[:80]})
         thinking_on = (payload.get("thinking") or {}).get("type") == "enabled"
         if thinking_on:
@@ -134,6 +135,13 @@ def main():
         assert c["thinking"] == {"type": "disabled"}, f"thinking 未关闭: {c['thinking']}"
     print(f"检查了 {len(CAPTURED)} 个请求：图片 data URI ✓  JSON 模式 ✓  Bearer 认证 ✓  "
           f"thinking 已关闭 ✓")
+
+    print("[5] 子图 + 共用图例的双图请求与缓存")
+    ax = vt.read_axis_ranges(vlm, image, figure_path=image, panel_label='(b)')
+    assert CAPTURED[-1]['image_count'] == 2, '整图上下文未发送到服务端'
+    calls = len(CAPTURED)
+    vt.read_axis_ranges(vlm, image, figure_path=image, panel_label='(b)')
+    assert len(CAPTURED) == calls, '双图请求缓存未命中'
 
     print("\n[回归] 模拟 thinking 模式被开启时的空内容 bug")
     bad = vc.DeepSeekVLM(api_key="sk-mock", base_url=f"http://127.0.0.1:{port}",

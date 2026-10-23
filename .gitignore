@@ -1,15 +1,17 @@
-# 本地密钥：绝不入库
+# 本地配置与密钥
 deepseek_key.txt
 secrets.json
+.deepseek-key-*.tmp
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
 
-# 运行产物（全部可由 run.py 重建，提交时不应入库）
+# 输入与运行产物
 output/
 out*/
 *_out/
 my_data.dat
-HANDOFF.md
-DESKTOP_APP_PLAN.md
-# 批量输入：论文原文受版权保护，绝不入库
 papers/
 *.pdf
 !test_vector.pdf
@@ -18,9 +20,15 @@ papers/
 .vlm_cache/
 .vlm_log.jsonl
 .templates/
+.ui_workspace/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
 
 # 临时文件
 *.log
 *.err
+
+# 本地 Python 环境
+.venv*/
+venv/

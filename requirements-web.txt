@@ -1,0 +1,2 @@
+# 网页界面；单独安装时需同时安装 requirements-core.txt。
+streamlit>=1.50

@@ -93,6 +93,34 @@ def order_row_major(boxes, row_tol_frac=0.35):
     return ordered
 
 
+def panel_crop_bounds(box, frames, shape, margin=None):
+    """Keep labels on every side and clip context before adjacent plotting frames."""
+    h, w = shape[:2]
+    x0, y0, x1, y1 = box
+    bw, bh = x1 - x0, y1 - y0
+    if margin is None:
+        pads = (max(100, int(.22 * bw)), max(60, int(.12 * bh)),
+                max(60, int(.12 * bw)), max(120, int(.30 * bh)))
+    else:
+        pads = (margin,) * 4
+    crop = [max(0, x0 - pads[0]), max(0, y0 - pads[1]),
+            min(w, x1 + pads[2]), min(h, y1 + pads[3])]
+    for a, b, c, d in frames:
+        if (a, b, c, d) == tuple(box):
+            continue
+        if min(y1, d) > max(y0, b):
+            if c <= x0:
+                crop[0] = max(crop[0], int(c+.30*(x0-c)))
+            elif a >= x1:
+                crop[2] = min(crop[2], int(x1+.30*(a-x1)))
+        if min(x1, c) > max(x0, a):
+            if d <= y0:
+                crop[1] = max(crop[1], int(d+.80*(y0-d)))
+            elif b >= y1:
+                crop[3] = min(crop[3], int(y1+.80*(b-y1)))
+    return tuple(crop)
+
+
 def model_plot_boxes(data, image_shape, expected=None):
     """Validate model-supplied normalised plot rectangles.
 
@@ -167,6 +195,65 @@ def refine_plot_box(gray, box, edge_thresh=245, search_frac=0.08):
     h, w = gray.shape[:2]
     x0, y0, x1, y1 = [int(v) for v in box]
     bw, bh = max(1, x1 - x0), max(1, y1 - y0)
+    # A coarse model rectangle can include an entire legend row. Locate connected
+    # axis spines in its neighbourhood before independently snapping four edges.
+    # Their endpoints establish one coherent coordinate system, including open axes.
+    px, py = int(.18 * bw), int(.22 * bh)
+    ax0, ay0 = max(0, x0 - px), max(0, y0 - py)
+    ax1, ay1 = min(w, x1 + px), min(h, y1 + py)
+    patch = gray[ay0:ay1, ax0:ax1]
+    coherent = []
+    closed = []
+    for threshold in (120, 180, 225, 245):
+        closed.extend(find_panel_boxes(patch, dark_thresh=threshold,
+                                       edge_thresh=threshold, max_area_frac=.92))
+        closed.extend((l,t,r-l,b-t) for l,t,r,b in el.find_boxes(
+            patch, dark_thresh=threshold, min_run_frac=.25, min_frac=.10, keep_nested=True))
+    candidates = [(True, b) for b in closed] + [(False, b) for b in find_spine_boxes(patch)]
+    for is_closed, (cx, cy, cw, ch) in candidates:
+        candidate = (cx + ax0, cy + ay0, cw, ch)
+        if not (.65 * bw <= cw <= 1.35 * bw and .6 * bh <= ch <= 1.35 * bh):
+            continue
+        # A page separator crossing the extended axis columns can form a false
+        # rectangle. Real vertical spines must support the proposed frame height.
+        if is_closed:
+            supports = []
+            for edge in (cx, cx+cw):
+                strip = patch[max(0,cy):cy+ch+1, max(0,edge-2):edge+3] < 245
+                supports.append(float(np.mean(np.any(strip, axis=1))) if strip.size else 0.)
+            for edge in (cy,cy+ch):
+                strip = patch[max(0,edge-2):edge+3,max(0,cx):cx+cw+1]<245
+                supports.append(float(np.mean(np.any(strip,axis=0))) if strip.size else 0.)
+            if (min(supports,default=0.)<.92 or el.rectangle_edge_extensions(
+                    patch,(cx,cy,cx+cw,cy+ch))>=2):
+                continue
+        internal = [b for b in closed if b[0] >= cx-3 and b[1] >= cy-3
+                    and b[0]+b[2] <= cx+cw+3 and b[1]+b[3] <= cy+ch+3
+                    and b[2] >= .75*cw and .15*ch <= b[3] <= .85*ch
+                    and el.rectangle_edge_extensions(patch,
+                        (b[0],b[1],b[0]+b[2],b[1]+b[3]))<2]
+        if any(a[1]+a[3]+6 < b[1] for a in internal for b in internal):
+            continue  # A frame containing two separated coordinate panels is invalid.
+        separated_border = False
+        for a in closed:
+            gap_start, gap_end = a[1] + a[3] + 3, cy + ch - 3
+            if (abs(a[0]-cx) <= 3 and abs(a[1]-cy) <= 3 and abs(a[2]-cw) <= 3
+                    and 6 < gap_end-gap_start < .15*ch):
+                edges = patch[gap_start:gap_end, max(0,cx-1):cx+2] < 245
+                if edges.size and _longest_bounds(edges.mean(axis=1) < .2)[0] >= 4:
+                    separated_border = True
+                    break
+        if separated_border:
+            continue
+        dx = abs(candidate[0] + cw / 2 - (x0 + x1) / 2) / bw
+        dy = abs(candidate[1] + ch / 2 - (y0 + y1) / 2) / bh
+        area = _inter(candidate, (x0, y0, bw, bh))
+        iou = area / max(1, cw * ch + bw * bh - area)
+        if dx <= .16 and dy <= .22 and iou >= .55:
+            coherent.append((iou - .2 * (dx + dy) + (.3 if is_closed else 0), candidate))
+    if coherent:
+        _score, (cx, cy, cw, ch) = max(coherent)
+        return (cx, cy, cx + cw, cy + ch)
     sx, sy = max(5, int(search_frac * bw)), max(5, int(search_frac * bh))
     wx0, wx1 = max(0, x0 - sx), min(w, x1 + sx + 1)
     wy0, wy1 = max(0, y0 - sy), min(h, y1 + sy + 1)

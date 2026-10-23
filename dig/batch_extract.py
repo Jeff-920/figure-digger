@@ -18,6 +18,7 @@ from pathlib import Path
 import cv2
 import imgio as iio
 import numpy as np
+from detection_cache import cached_detection
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import extract_lines as el  # noqa: E402
@@ -245,7 +246,34 @@ def process_panel(image_path, rng, outdir, sat_min, val_min, hue_tol,
     }
 
 
-def legend_boxes(img, frame, max_frac_w=0.60, max_frac_h=0.40):
+def _closed_rectangle(gray,box,min_cover=.92,max_gray=245,img=None):
+    x,y,w,h = map(int,box)
+    if min(w,h)<4:
+        return False
+    rows,cols = gray.shape
+    right,bottom = min(cols-1,x+w),min(rows-1,y+h)
+    if x<0 or y<0 or x>=right or y>=bottom:
+        return False
+    ink = gray<max_gray
+    if img is not None:
+        # Shaded uncertainty bands and coloured curves are not rectangular
+        # borders, even when their pixels happen to cover four candidate edges.
+        ink &= cv2.cvtColor(img,cv2.COLOR_BGR2HSV)[:,:,1]<65
+    edges = [ink[max(0,y-1):min(rows,y+2),x:right+1].any(axis=0),
+             ink[max(0,bottom-1):min(rows,bottom+2),x:right+1].any(axis=0),
+             ink[y:bottom+1,max(0,x-1):min(cols,x+2)].any(axis=1),
+             ink[y:bottom+1,max(0,right-1):min(cols,right+2)].any(axis=1)]
+    return min(float(e.mean()) for e in edges)>=min_cover
+
+
+def _extended_rectangle_edges(gray,box):
+    """Count sides that continue past a corner, as chart grid lines do."""
+    x,y,w,h = map(int,box)
+    return el.rectangle_edge_extensions(gray,(x,y,x+w,y+h))
+
+
+@cached_detection
+def legend_boxes(img, frame, max_frac_w=0.75, max_frac_h=0.65):
     """Detect legend boxes inside the plot frame using their colour swatches.
 
     `extract_lines.find_boxes` 只认深色边构成的框，而期刊图里的图例框常常是浅灰
@@ -262,22 +290,45 @@ def legend_boxes(img, frame, max_frac_w=0.60, max_frac_h=0.40):
     left, top, right, bottom = frame
     fw, fh = max(1, right - left), max(1, bottom - top)
     cands = []
-    for th in (120, 180, 205):
+    for th in (120, 180, 225,245):
         cands += lc.find_boxes(gray, th)
+        cands += [(l,t,r-l,b-t) for l,t,r,b in
+                  el.find_boxes(gray,th,min_run_frac=.1,min_frac=.05,keep_nested=True)]
     boxes = []
     for (x, y, w, h) in cands:
-        if not (x > left and y > top and x + w < right and y + h < bottom):
+        if (not _closed_rectangle(gray,(x,y,w,h),img=img)
+                or _extended_rectangle_edges(gray,(x,y,w,h))>=2):
+            continue
+        if not (x>=left-3 and y>=top-3 and x+w<=right+3 and y+h<=bottom+3):
             continue
         if w > max_frac_w * fw or h > max_frac_h * fh:
+            continue
+        # Coloured zoom-reference frames can enclose real data and axis labels.
+        # Their coloured border is not a legend's neutral rectangular outline.
+        hsv_patch = cv2.cvtColor(img[y:y+h,x:x+w],cv2.COLOR_BGR2HSV)
+        border_sat = np.concatenate([hsv_patch[:2,:,1].ravel(),hsv_patch[-2:,:,1].ravel(),
+                                     hsv_patch[:,:2,1].ravel(),hsv_patch[:,-2:,1].ravel()])
+        if np.mean(border_sat>80)>.2:
             continue
         sw = [s for s in lc.find_swatches(img, (x, y, w, h), min_run=12)
               if s["thickness_px"] <= 12]
         # 只要求"框里有色块"：图例的排版很自由（三角形标记 + 点划线样本 + 文字），
         # 硬要求"≥2 条等宽对齐的横条"会漏掉单条目图例。确认是图例后整框屏蔽。
-        if sw:
+        patch = img[y:y+h,x:x+w]
+        if patch.size==0:
+            continue
+        dark_text = ((cv2.cvtColor(patch,cv2.COLOR_BGR2GRAY)<150)
+                     & (cv2.cvtColor(patch,cv2.COLOR_BGR2HSV)[:,:,1]<60)).astype(np.uint8)
+        count,_labels,stats,_centres = cv2.connectedComponentsWithStats(dark_text)
+        letters = [s for s in stats[1:count] if 3<=s[cv2.CC_STAT_HEIGHT]<=.25*fh
+                   and 2<=s[cv2.CC_STAT_WIDTH]<=.20*fw and s[cv2.CC_STAT_AREA]>=5]
+        if sw and len(letters)>=5:
             boxes.append((x, y, w, h))
     keep = []
-    for b in sorted(boxes, key=lambda t: -t[2] * t[3]):
+    for b in sorted(boxes, key=lambda t: t[2] * t[3]):
+        if any(k[0]>=b[0]-3 and k[1]>=b[1]-3 and k[0]+k[2]<=b[0]+b[2]+3
+               and k[1]+k[3]<=b[1]+b[3]+3 for k in keep):
+            continue
         if any(abs(b[0] - k[0]) < 12 and abs(b[1] - k[1]) < 12
                and abs(b[2] - k[2]) < 12 and abs(b[3] - k[3]) < 12 for k in keep):
             continue
@@ -299,11 +350,13 @@ def inner_boxes(gray, frame, max_frac=0.92, img=None):
     # 内部小框（图例/放大子图）的边比坐标框短得多：主检测用 40% 图宽作门槛时，
     # 嵌在绘图区里的图例框常常差一点点而漏掉（实测 2014-01-1413 p14），
     # 所以这里单独放宽到 15% 再筛"是不是在坐标框里面"。
-    for (l, t, r, b) in el.find_boxes(gray, min_run_frac=0.15)[1:]:
-        if l > left and t > top and r < right and b < bottom:
-            out.append((l, t, r - l, b - t))
+    margin = max(5,int(.01*min(fw,fh)))
+    for threshold in (120,180,225,245):
+        for l,t,r,b in el.find_boxes(gray,threshold,min_run_frac=.12,min_frac=.10,keep_nested=True):
+            if l>=left+margin and t>=top+margin and r<=right-margin and b<=bottom-margin:
+                out.append((l,t,r-l,b-t))
     for (x, y, w, h) in el.find_inner_boxes((gray < 120).astype(np.uint8) * 255):
-        if (x > left and y > top and x + w < right and y + h < bottom
+        if (x>=left+margin and y>=top+margin and x+w<=right-margin and y+h<=bottom-margin
                 and w < max_frac * fw and h < max_frac * fh):
             out.append((x, y, w, h))
     keep = []
@@ -312,11 +365,17 @@ def inner_boxes(gray, frame, max_frac=0.92, img=None):
         return any(abs(b[0] - k[0]) < 14 and abs(b[1] - k[1]) < 14
                    and abs(b[2] - k[2]) < 14 and abs(b[3] - k[3]) < 14 for k in legend)
 
-    for b in out:
+    for b in sorted(out,key=lambda b:-b[2]*b[3]):
+        if (not _closed_rectangle(gray,b,max_gray=180,img=img)
+                or _extended_rectangle_edges(gray,b)>=2):
+            continue
         if in_legend(b):
             # 图例由下面的 `legend` 统一整框加入，避免重复。
             continue
         if b[2] < 0.10 * fw or b[3] < 0.07 * fh:
+            continue
+        if any(b[0]>=k[0]-3 and b[1]>=k[1]-3 and b[0]+b[2]<=k[0]+k[2]+3
+               and b[1]+b[3]<=k[1]+k[3]+3 for k in keep):
             continue
         if any(abs(b[0] - k[0]) < 8 and abs(b[1] - k[1]) < 8
                and abs(b[2] - k[2]) < 8 and abs(b[3] - k[3]) < 8 for k in keep):
@@ -333,45 +392,20 @@ def inner_boxes(gray, frame, max_frac=0.92, img=None):
 
 
 def _frame_of(gray, frame_hint=None):
-    """Locate the axes box; fall back to the caller's hint when detection fails.
-
-    Two failure modes showed up on real papers and both used to end with zero points
-    extracted: (a) a tight crop puts the frame within the `edge_frac` border that is
-    discarded by design, (b) a cropped vector chart has no long enough dark run for
-    `find_frame`. When the caller already knows the box (from the PDF itself) there is
-    no reason to give up on it.
-
-    第三种实测情形（2023-01-1635 图 4）：图上有一圈**图幅外框**，`find_frame` 会挑它，
-    而配置里的坐标框正好在外框里面一圈——于是 `inner_boxes` 把整个绘图区当成"内嵌框"
-    排除掉，一条曲线都提不出来。判据很简单：配置框**严格落在**检出框里面时，配置框才是
-    坐标框。
-    """
-    try:
-        det = el.find_frame(gray)
-    except RuntimeError:
-        det = None
+    """Use the calibrated frame consistently; detect only when none was supplied."""
     hint = None
     if frame_hint:
         h, w = gray.shape[:2]
         if 0 <= frame_hint[0] < frame_hint[2] <= w and 0 <= frame_hint[1] < frame_hint[3] <= h:
             hint = tuple(int(v) for v in frame_hint)
-    if det is not None:
-        if hint and (det[0] < hint[0] and det[1] < hint[1]
-                     and det[2] > hint[2] and det[3] > hint[3]):
-            return hint                                # 检出的是图幅外框，配置框才是坐标框
-        return det
+    if hint is not None:
+        # Calibration, planner anchors and pixel tracing must use the SAME frame.
+        # Re-detecting it here can silently replace a subplot by a legend/outer box.
+        return hint
     try:
-        det = el.find_frame(gray, edge_frac=0.0)      # (a)
-        if hint and (det[0] < hint[0] and det[1] < hint[1]
-                     and det[2] > hint[2] and det[3] > hint[3]):
-            return hint
-        return det
+        return el.find_frame(gray, edge_frac=0.0)
     except RuntimeError:
         pass
-    h, w = gray.shape[:2]
-    if frame_hint and 0 <= frame_hint[0] < frame_hint[2] <= w \
-            and 0 <= frame_hint[1] < frame_hint[3] <= h:
-        return tuple(int(v) for v in frame_hint)      # (b)
     raise RuntimeError("plot frame not found - try lowering --dark-thresh")
 
 

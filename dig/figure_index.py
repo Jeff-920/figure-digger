@@ -10,14 +10,16 @@ Two jobs:
    its bottom (or top) edge; body references lose on both distance and phrasing.
 
 2. Figure selection from one sentence.
-   The user writes what they want ("某某条件下速度随时间的折线图"). A figure number in
-   that sentence is matched locally for free; otherwise one VLM call gets the caption
-   index *and* a numbered contact sheet of the candidates, because what the axes plot
-   is written inside the figure, not in its caption. A paper may simply not contain the
-   chart - the model is required to say so and list what is actually there.
+   Pure figure-number requests are matched locally. Semantic requests inspect every
+   original figure with full captions, then reconcile all axis/condition evidence,
+   consulting paper-wide figure mentions when needed. Failed or unclear inspections
+   remain unresolved; thumbnails and shortlists never establish absence.
 """
 
+import json
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -25,11 +27,9 @@ import imgio as iio
 import numpy as np
 
 import vlm_tasks as vt
-import vlm_client as vlmc
 
-SHEET_MAX = 12          # 对照图最多放几张缩略图（再多就小到看不清坐标轴了）
+SHEET_MAX = 12          # 仅用于诊断对照图，检索不再按此截断候选
 TILE_W, TILE_H = 430, 300
-BODY_TRIGGER = 0.6      # 选图置信度低于这个值，就去正文里再问一次
 
 LABEL_NUM_RE = re.compile(r"(?:fig(?:ure)?s?\.?|图|圖)\s*(\d+)", re.IGNORECASE)
 # 正文里的引用句：Figure 3 shows… / Figure 2) is used… / Figure 15 and Figure 16 gives…
@@ -130,6 +130,7 @@ def attach_captions(cards, captions_by_page, log=None):
             if not cap:
                 continue
             card["caption"] = cap["text"]
+            card["caption_bbox"] = cap["bbox"]
             card["label"] = cap["label"]
             card["caption_kind"] = "title" if looks_like_title(cap["text"]) else "body-ref"
             card["caption_shared"] = card["id"] not in direct
@@ -146,7 +147,7 @@ def _by_page(cards):
     return out
 
 
-def index_text(cards, max_caption=200, numbers=None):
+def index_text(cards, max_caption=4000, numbers=None):
     """The plain-text figure list handed to the model (numbers = candidate numbers)."""
     numbers = numbers or list(range(1, len(cards) + 1))
     lines = []
@@ -155,7 +156,7 @@ def index_text(cards, max_caption=200, numbers=None):
         if c.get("caption"):
             parts.append(f"图注: {c['caption'][:max_caption]}")
         if c.get("inner_text"):
-            parts.append(f"图内文字: {c['inner_text'][:160]}")
+            parts.append(f"图内文字: {c['inner_text'][:4000]}")
         if not c.get("caption") and not c.get("inner_text"):
             parts.append("（没有图注文字，只能看缩略图）")
         lines.append(" ｜ ".join(parts))
@@ -204,6 +205,10 @@ def local_match(want, cards):
     wanted = {int(n) for n in LABEL_NUM_RE.findall(want or "")}
     if not wanted:
         return [], ""
+    remainder = LABEL_NUM_RE.sub("", want or "")
+    remainder = re.sub(r"\b(?:and|or)\b|[\s,，、;；与和及]", "", remainder, flags=re.I)
+    if remainder:
+        return [], ""    # “Figure 5 中的贯穿距”仍需要语义和子图核对
     ids = [c["id"] for c in cards if label_number(c.get("label")) in wanted]
     if ids:
         return ids, f"需求里的编号直接命中图 {sorted(wanted)}"
@@ -217,147 +222,220 @@ def _candidates(cards, selected=(), screened=None):
         out.append({"n": n, "id": card["id"], "label": card.get("label") or "",
                     "page": card["page"], "caption": (card.get("caption") or "")[:200],
                     "selected": card["id"] in selected,
-                    "screened": (n in screened) if screened else True})
+                    "screened": (n in screened) if screened is not None else True})
     return out
 
 
 def _pick(data, cards):
     """Model reply -> list of card ids (numbers are 1-based positions in the index)."""
     picked = []
-    for n in (data.get("selected") or []):
-        try:
-            n = int(n)
-        except (TypeError, ValueError):
+    values = data.get("selected") or []
+    if not isinstance(values, list):
+        return []
+    for n in values:
+        if isinstance(n, bool) or not re.fullmatch(r"[0-9]+", str(n)):
             continue
+        n = int(n)
         if 1 <= n <= len(cards) and cards[n - 1]["id"] not in picked:
             picked.append(cards[n - 1]["id"])
     return picked
 
 
+def render_selection_images(pdf, cards, out_dir, dpi=220, margin=36):
+    """Render individual figures with axis/title context missing from PDF image objects."""
+    folder = Path(out_dir) / "originals"
+    folder.mkdir(parents=True, exist_ok=True)
+    for i, card in enumerate(cards, 1):
+        page = pdf.pages[card["page"] - 1]
+        a = card["bbox"]
+        box = [max(0, a[0] - margin), max(0, a[1] - margin),
+               min(page.width, a[2] + margin), min(page.height, a[3] + margin)]
+        # Clip expanded margins at the midpoints between neighbouring figures.
+        for other in cards:
+            if other is card or other["page"] != card["page"]:
+                continue
+            b = other["bbox"]
+            if _overlap_x(a, b) > 0:
+                if b[3] <= a[1]:
+                    box[1] = max(box[1], (b[3] + a[1]) / 2)
+                elif b[1] >= a[3]:
+                    box[3] = min(box[3], (a[3] + b[1]) / 2)
+            if min(a[3], b[3]) > max(a[1], b[1]):
+                if b[2] <= a[0]:
+                    box[0] = max(box[0], (b[2] + a[0]) / 2)
+                elif b[0] >= a[2]:
+                    box[2] = min(box[2], (a[2] + b[0]) / 2)
+        try:
+            path = folder / f"{i:03d}.png"
+            page.crop(tuple(box), strict=False).to_image(resolution=dpi).original.save(path)
+            card["selection_image"] = path
+        except Exception:  # Keep the native export when page rendering fails.
+            card["selection_image"] = card.get("thumb")
+
+
+def _verdict(inspection):
+    """False requires explicit contradictory evidence; missing fields stay unknown."""
+    if inspection.get("is_data_chart") is False:
+        return False
+    rows = [p for p in (inspection.get("panels") or []) if isinstance(p, dict)]
+    if not rows:
+        return None
+    values = []
+    for p in rows:
+        if p.get("axes_match") is False or p.get("conditions_match") is False:
+            values.append(False)
+        elif (p.get("matches_request") is True and p.get("axes_match") is True
+              and p.get("conditions_match") is True):
+            values.append(True)
+        else:
+            values.append(None)
+    if True in values:
+        return True
+    return False if all(v is False for v in values) else None
+
+
 def select(want, cards, vlm=None, out_dir=None, log=None, body_text=None, deep=False):
-    """Decide which figures the request is about. Returns a decision record.
+    """Read every candidate at original resolution, then resolve missing body evidence.
 
-    body_text: callable returning the paper's figure-mentioning paragraphs, or None.
-               It is only called when the caption/thumbnail pass does not settle the
-               question, so most papers never pay for it.
-    deep:      always ask the body-text pass, even when the captions already matched.
+    No text shortlist or thumbnail confidence can hide a candidate from vision.
+    A missing/failed model response is uncertainty, never proof of absence.
     """
+    decision = {"want": want, "method": "none", "ids": [], "missing": True,
+                "reason": "这篇里没找到任何候选图", "available": "",
+                "body_used": False, "body_chars": 0, "body_reason": "", "body_tokens": 0}
     if not cards:
-        return {"want": want, "method": "none", "ids": [], "missing": True,
-                "reason": "这篇里没找到任何候选图", "available": "", "candidates": []}
-
+        decision["candidates"] = []
+        return decision
     ids, how = local_match(want, cards)
     if ids:
-        if log:
-            log(f"      需求命中（本地编号匹配，未调用模型）：{how}")
-        return {"want": want, "method": "label", "ids": ids, "missing": False,
-                "reason": how, "available": "", "body_used": False, "body_chars": 0,
-                "body_reason": "", "candidates": _candidates(cards, selected=ids)}
-
+        decision.update(method="label", ids=ids, missing=False, reason=how,
+                        candidates=_candidates(cards, selected=ids, screened=set()))
+        return decision
     if vlm is None:
-        reason = "未启用 VLM：只能按图号找图（如 --want 'Figure 5'），无法按图的内容找"
-        if log:
-            log(f"      ✗ {reason}")
-        return {"want": want, "method": "none", "ids": [], "missing": True,
-                "reason": reason, "available": "", "body_used": False, "body_chars": 0,
-                "body_reason": "", "candidates": _candidates(cards)}
+        decision.update(missing=None, reason="未启用 VLM：只能按图号找图，无法按内容判断是否存在",
+                        candidates=_candidates(cards, screened=set()))
+        return decision
 
-    index = index_text(cards)
-    numbers = list(range(1, len(cards) + 1))
-    sheet_cards = cards
-    if len(cards) > SHEET_MAX:                  # 先纯文字粗筛，对照图只放得下 12 张
+    inspections, screened = {}, set()
+    fatal_error = ""
+    def inspect_one(n, card, client):
+        path = card.get("selection_image") or card.get("thumb")
         try:
-            pre = vt.shortlist_figures(vlm, want, index)
-            keep = [int(n) for n in (pre.get("shortlist") or [])
-                    if str(n).isdigit() and 1 <= int(n) <= len(cards)]
-        except Exception:  # noqa: BLE001
-            keep = []
-        if keep:
-            numbers = keep[:SHEET_MAX]
-            sheet_cards = [cards[n - 1] for n in numbers]
-            if log:
-                log(f"      文字粗筛 -> 候选 {len(cards)} 张中的 {len(numbers)} 张进对照图")
-        else:
-            numbers = numbers[:SHEET_MAX]
-            sheet_cards = cards[:SHEET_MAX]
+            data = vt.inspect_figure(client, want, index_text([card], numbers=[n]), path)
+            # A missing image is visible in the audit and cannot justify a confident rejection.
+            if path is None:
+                data["image_missing"] = True
+            return {k: v for k, v in data.items() if k != "_raw"}, path is not None
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {exc}", "panels": []}, False
 
-    sheet = None
-    screened = None
-    if out_dir is not None:
-        sheet = build_contact_sheet(sheet_cards, out_dir, numbers=numbers)
-    if len(cards) > SHEET_MAX:
-        screened = set(numbers)          # 粗筛后进对照图的那几张，其余只是没进画面
-        index = index_text(sheet_cards, numbers=numbers)   # 看图这一步只带候选的图注
+    def record(n, card, result):
+        nonlocal fatal_error
+        inspections[n], seen = result
+        if seen:
+            screened.add(n)
+        error = inspections[n].get("error", "")
+        if re.search(r"\b(?:401|402)\b", error):
+            fatal_error = error
+        if log:
+            verdict = _verdict(inspections[n])
+            log(f"      原图语义核对 {n}/{len(cards)} {card.get('label') or card['id']}: "
+                + ("符合" if verdict is True else "不符" if verdict is False else "待核对"))
+
     try:
-        data = vt.select_figures(vlm, want, index, image_path=sheet)
-    except Exception as exc:  # noqa: BLE001
-        return {"want": want, "method": "error", "ids": [], "missing": None,
-                "reason": f"{type(exc).__name__}: {exc}", "available": "",
-                "candidates": _candidates(cards, screened=screened)}
+        workers = max(1, min(3, int(os.environ.get("DIG_SELECT_WORKERS", "2"))))
+    except ValueError:
+        workers = 2
+    # Custom/mock clients without isolated request state retain their serial contract.
+    if not callable(getattr(vlm, "fork", None)):
+        workers = 1
+    if workers == 1:
+        for n, card in enumerate(cards, 1):
+            result = ({"error": fatal_error, "panels": []}, False) if fatal_error else inspect_one(n, card, vlm)
+            record(n, card, result)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # Bounded batches: fatal authentication errors cannot enqueue the entire paper.
+            for start in range(0, len(cards), workers):
+                batch = list(enumerate(cards[start:start + workers], start + 1))
+                if fatal_error:
+                    for n, card in batch:
+                        record(n, card, ({"error": fatal_error, "panels": []}, False))
+                    continue
+                jobs = []
+                for n, card in batch:
+                    child = vlm.fork()
+                    jobs.append((n, card, child, pool.submit(inspect_one, n, card, child)))
+                for n, card, child, future in jobs:
+                    result = future.result()
+                    for key, value in child.usage.items():
+                        vlm.usage[key] = vlm.usage.get(key, 0) + value
+                    record(n, card, result)
 
-    picked = _pick(data, cards)
-    conf = data.get("confidence")
-    conf = float(conf) if isinstance(conf, (int, float)) else None
-    reason = str(data.get("reason") or "")[:400]
-    available = str(data.get("available") or "")[:400]
-    body_note, body_chars, body_tokens = "", 0, 0
-
-    # ---- 第二步（按需）：正文里提到图的段落。图注说不清"哪张图对应哪个工况"时，
-    #      只有正文会写 "Figure 5 presents the penetration at Pi = 800 bar"。----
-    need_body = body_text is not None and (deep or not picked
-                                           or (conf is not None and conf < BODY_TRIGGER))
-    if need_body:
+    # Always carry the FULL candidate inventory, even if most figures were rejected.
+    evidence_index = "\n".join(
+        index_text([c], numbers=[n]) + "\n原图读图记录: "
+        + json.dumps(inspections[n], ensure_ascii=False)
+        for n, c in enumerate(cards, 1))
+    unresolved = {n for n, d in inspections.items() if _verdict(d) is None}
+    positives = [n for n, d in inspections.items() if _verdict(d) is True]
+    need_body = deep or bool(unresolved) or not positives or any(
+        d.get("needs_body") for d in inspections.values())
+    digest = ""
+    if need_body and body_text is not None:
         try:
             digest = body_text() or ""
-        except Exception as exc:  # noqa: BLE001
-            digest = ""
-            log and log(f"      正文摘要提取失败：{type(exc).__name__}: {exc}")
-        body_chars = len(digest)
+        except Exception as exc:
+            decision["body_reason"] = f"正文提取失败：{type(exc).__name__}: {exc}"
+    decision.update(body_used=bool(digest), body_chars=len(digest))
+    usage0 = dict(getattr(vlm, "usage", {}))
+    try:
+        if fatal_error:
+            raise RuntimeError(fatal_error)
+        data = vt.select_figures_by_evidence(vlm, want, evidence_index, digest)
+        requested_labels = {int(x) for x in LABEL_NUM_RE.findall(want or "")}
+        picked = _pick(data, cards)
+        # Explicit visible axis/condition contradictions cannot be overturned by prose.
+        forbidden = {cards[n - 1]["id"] for n, d in inspections.items() if _verdict(d) is False}
+        picked = [cid for cid in picked if cid not in forbidden and (
+            not requested_labels or label_number(next(c for c in cards if c["id"] == cid).get("label"))
+            in requested_labels)]
+        model_unresolved = set(_pick({"selected": data.get("unresolved") or []}, cards))
+        # Missing/failed images remain unresolved even if the summarizer claims otherwise.
+        uncertain_ids = model_unresolved | {cards[n - 1]["id"] for n, d in inspections.items()
+                                           if _verdict(d) is None or d.get("error")
+                                           or d.get("image_missing")}
+        uncertain_ids -= set(picked)
+        decision.update(method="vlm-originals", ids=picked,
+                        missing=False if picked else None if uncertain_ids else True,
+                        unresolved_ids=sorted(uncertain_ids),
+                        reason=str(data.get("reason") or ""),
+                        available=str(data.get("available") or ""),
+                        confidence=data.get("confidence"), evidence=data.get("evidence") or [])
         if digest:
-            if log:
-                log(f"      再问一次正文（提到图的段落 {body_chars} 字符）")
-            usage0 = dict(vlm.usage)
-            try:
-                bdata = vt.select_figures_by_body(vlm, want, index, digest)
-                bpick = _pick(bdata, cards)
-                breason = str(bdata.get("reason") or "")[:400]
-                conf2 = bdata.get("confidence")
-                conf2 = float(conf2) if isinstance(conf2, (int, float)) else None
-                body_note = breason
-                if bpick:
-                    if log:
-                        log(f"      正文判定的结果：{len(bpick)} 张 -> "
-                            f"{', '.join(bpick)}（依据：{breason[:60]}）")
-                    picked, reason = bpick, breason      # 正文证据更具体，采用它
-                    conf = conf2 if conf2 is not None else conf
-                    available = str(bdata.get("available") or "")[:400]
-                elif log:
-                    log(f"      正文也没有找到（依据：{breason[:60]}）")
-            except Exception as exc:  # noqa: BLE001
-                body_note = f"{type(exc).__name__}: {exc}"
-                if log:
-                    log(f"      正文通道失败：{body_note}")
-            du = {k: vlm.usage.get(k, 0) - usage0.get(k, 0) for k in vlm.usage}
-            body_tokens = du["prompt_tokens"] + du["completion_tokens"]
-            pr = vlmc.PRICES.get(getattr(vlm, "model", ""))
-            if pr and body_tokens:
-                lo = (du["prompt_tokens"] / 1e6 * pr["in_miss"][0]
-                      + du["completion_tokens"] / 1e6 * pr["out"][0])
-                hi = (du["prompt_tokens"] / 1e6 * pr["in_miss"][1]
-                      + du["completion_tokens"] / 1e6 * pr["out"][1])
-                if log:
-                    log(f"      正文通道花费（实测）：{body_tokens:,} tokens "
-                        f"≈ ¥{lo * 7.2:.3f}~¥{hi * 7.2:.3f}")
-    if log:
-        if picked:
-            log(f"      模型选中 {len(picked)} 张：{', '.join(picked)}")
-        else:
-            log("      模型判定：这篇里没有符合需求的图")
-    return {"want": want, "method": "vlm", "ids": picked,
-            "missing": not picked,
-            "reason": reason, "confidence": conf,
-            "body_used": bool(body_chars), "body_chars": body_chars, "body_reason": body_note,
-            "body_tokens": body_tokens,
-            "available": available,
-            "screened_n": len(numbers) if screened else len(cards),
-            "candidates": _candidates(cards, selected=set(picked), screened=screened)}
+            decision["body_reason"] = decision["reason"]
+    except Exception as exc:
+        # Retain individually established matches, but report incomplete search honestly.
+        picked = [cards[n - 1]["id"] for n in positives]
+        uncertain_ids = {cards[n - 1]["id"] for n in unresolved}
+        decision.update(method="error", ids=picked, missing=False if picked else None,
+                        unresolved_ids=sorted(uncertain_ids),
+                        reason=f"选图汇总失败：{type(exc).__name__}: {exc}")
+    usage = getattr(vlm, "usage", {})
+    if digest:
+        decision["body_tokens"] = sum(usage.get(k, 0) - usage0.get(k, 0)
+                                      for k in ("prompt_tokens", "completion_tokens"))
+    rows = _candidates(cards, selected=decision["ids"], screened=screened)
+    for row in rows:
+        d = inspections[row["n"]]
+        row["inspection"] = d
+        row["status"] = ("selected" if row["selected"] else "unresolved"
+                         if row["id"] in decision.get("unresolved_ids", []) else "rejected")
+    decision.update(candidates=rows, screened_n=len(screened), inspected_n=len(inspections))
+    if out_dir is not None:
+        # Optional diagnostics only; models receive individual images above.
+        for start in range(0, len(cards), SHEET_MAX):
+            folder = Path(out_dir) if start == 0 else Path(out_dir) / f"batch_{start // SHEET_MAX + 1}"
+            build_contact_sheet(cards[start:start + SHEET_MAX], folder,
+                                numbers=list(range(start + 1, min(start + SHEET_MAX, len(cards)) + 1)))
+    return decision

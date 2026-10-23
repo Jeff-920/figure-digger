@@ -53,7 +53,7 @@ def is_body_figure_reference(text):
     return not label.isupper() and bool(BODY_FIGURE_REF_RE.match(text or ""))
 
 
-def figure_mentions(page, context=3, min_chars=25):
+def figure_mentions(page, context=5, min_chars=8):
     """Body lines that talk about a figure, with the next line for context.
 
     The interesting sentences are the ones that say what a figure shows and under
@@ -75,7 +75,7 @@ def figure_mentions(page, context=3, min_chars=25):
         # 往往先出现同一高度的右栏文字，而不是左栏下一行。只在同一栏寻找
         # 真正位于下方的续行，避免把另一栏正文拼进 Figure 引用句。
         found = 0
-        for cand in lines[i + 1:i + 9]:
+        for cand in lines[i + 1:i + 2 * context + 5]:
             if cand["top"] < ln["bottom"] - 2.0:
                 continue
             same_column = (abs(cand["x0"] - ln["x0"]) <= 36.0
@@ -84,7 +84,8 @@ def figure_mentions(page, context=3, min_chars=25):
             if not same_column:
                 continue
             nxt = (cand.get("text") or "").strip()
-            if nxt and not CAPTION_RE.match(nxt) and nxt[0].islower():
+            if (nxt and not CAPTION_RE.match(nxt) and not TABLE_RE.match(nxt)
+                    and not HEADING_RE.fullmatch(nxt)):
                 piece += " " + nxt        # 句子被换行截断时接上后半句
                 found += 1
             if found >= context or cand["top"] > ln["bottom"] + 20.0:
@@ -179,7 +180,7 @@ def _line_from(words):
     }
 
 
-def join_caption_block(lines, i, max_lines=6, x_tol=18.0, max_chars=240):
+def join_caption_block(lines, i, max_lines=24, x_tol=18.0, max_chars=4000):
     """A caption usually runs over several lines; return the whole block.
 
     Only the first line starts with "Figure N", so without this the index used for
@@ -273,24 +274,79 @@ def analyse_page(page, page_no):
     }
 
 
+def image_groups(images, gap=1.0):
+    """PDF image objects may be strips of one figure, not independent figures.
+
+    Join touching/overlapping aligned strips transitively before cropping or finding
+    panels. A caption-sized gap keeps distinct figures separate.
+    """
+    groups = [{"bbox": list(im["bbox"]), "indices": [i + 1]}
+              for i, im in enumerate(images)
+              if im["display_pt"][0] > 0 and im["display_pt"][1] > 0]
+    changed = True
+    while changed:
+        changed = False
+        for i, a in enumerate(groups):
+            for j in range(i + 1, len(groups)):
+                b = groups[j]
+                x, y = a["bbox"], b["bbox"]
+                ox = _overlap_1d(x[0], x[2], y[0], y[2])
+                oy = _overlap_1d(x[1], x[3], y[1], y[3])
+                dx = max(x[0], y[0]) - min(x[2], y[2])
+                dy = max(x[1], y[1]) - min(x[3], y[3])
+                if ((ox >= 0.7 * min(x[2] - x[0], y[2] - y[0]) and dy <= gap)
+                        or (oy >= 0.7 * min(x[3] - x[1], y[3] - y[1]) and dx <= gap)):
+                    a["bbox"] = [min(x[0], y[0]), min(x[1], y[1]),
+                                 max(x[2], y[2]), max(x[3], y[3])]
+                    a["indices"] += b["indices"]
+                    groups.pop(j)
+                    changed = True
+                    break
+            if changed:
+                break
+    return [g for g in groups if g["bbox"][2] - g["bbox"][0] >= 60
+            and g["bbox"][3] - g["bbox"][1] >= 60]
+
+
 def export_figures(pdf, report, outdir, dpi):
     figdir = outdir / "figures"
     figdir.mkdir(parents=True, exist_ok=True)
     written = []
     for pageinfo in report["pages"]:
         page = pdf.pages[pageinfo["page"] - 1]
-        for idx, img in enumerate(pageinfo["images"]):
-            if img["display_pt"][0] < 60 or img["display_pt"][1] < 60:
-                continue  # skip logos / small decorations
-            bbox = tuple(img["bbox"])
+        groups = image_groups(pageinfo["images"])
+        for group in groups:
+            x0, y0, x1, y1 = group["bbox"]
+            # Tick labels and titles can be separate PDF text/vector objects outside
+            # the raster's rectangle. Render page context, not only the image object.
+            bbox = [max(0, x0 - 24), max(0, y0 - 24),
+                    min(page.width, x1 + 24), min(page.height, y1 + 24)]
+            for other in groups:
+                if other is group:
+                    continue
+                a, b, c, d = other["bbox"]
+                if _overlap_1d(x0, x1, a, c) > 0:
+                    if d <= y0:
+                        bbox[1] = max(bbox[1], (d + y0) / 2)
+                    elif b >= y1:
+                        bbox[3] = min(bbox[3], (b + y1) / 2)
+                if _overlap_1d(y0, y1, b, d) > 0:
+                    if c <= x0:
+                        bbox[0] = max(bbox[0], (c + x0) / 2)
+                    elif a >= x1:
+                        bbox[2] = min(bbox[2], (a + x1) / 2)
+            bbox = tuple(bbox)
             crop = page.crop(bbox, strict=False)
-            name = f"{report['pdf_stem']}_p{pageinfo['page']}_img{idx + 1}.png"
+            name = f"{report['pdf_stem']}_p{pageinfo['page']}_img{min(group['indices'])}.png"
             path = figdir / name
             try:
                 crop.to_image(resolution=dpi).save(path)
-                written.append({"file": str(path), "page": pageinfo["page"], "bbox": img["bbox"]})
+                written.append({"file": str(path), "page": pageinfo["page"],
+                                "bbox": list(bbox), "image_bbox": group["bbox"],
+                                "source_images": group["indices"]})
             except Exception as exc:  # pragma: no cover
-                written.append({"file": None, "page": pageinfo["page"], "bbox": img["bbox"], "error": str(exc)})
+                written.append({"file": None, "page": pageinfo["page"],
+                                "bbox": group["bbox"], "error": str(exc)})
     return written
 
 

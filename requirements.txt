@@ -1,29 +1,4 @@
-# DIGIT — 运行依赖（Python 3.10+）
-#   pip install -r requirements.txt
-#
-# 括号内为开发验证过的版本（Windows + Python 3.12）。
-
-# —— 必需 ——
-pdfplumber>=0.11          # PDF 解析（自动带上 pdfminer.six / pypdfium2 / Pillow）   验证: 0.11.10
-pypdfium2>=4              # 渲染 PDF 页面/裁剪图（pdfplumber 用它，缺了所有图都导不出来）
-pdfminer.six>=20221105    # pdfplumber 的解析后端（取文字、路径、图注）
-numpy>=1.24               # 数组与像素运算                                          验证: 2.4.x
-opencv-python>=4.10       # 图像处理：轴框检测、颜色匹配、质检图渲染                 验证: 4.11.0.86
-pillow>=10                # 图片读取/缩放与 token 尺寸估算（pdfplumber 也会带上，但直接用到需显式声明）
-
-# —— 可选：刻度 OCR ——
-# 不装也能跑：轴范围可改由 VLM 读取（--vlm），或人工填写后 extract。
-rapidocr-onnxruntime>=1.3 # 刻度数字识别                                             验证: 1.4.4
-pyyaml>=6                 # RapidOCR 读配置用；它自己声明了但 --no-deps 安装会漏掉，
-                          # 漏了会在运行时报 "No module named 'yaml'"
-shapely>=1.7              # 同上：RapidOCR 的传递依赖，缺了报错很晚才出现
-pyclipper>=1.2
-onnxruntime>=1.7
-six>=1.15
-tqdm
-
-# 说明
-#   * VLM 辅助（--vlm）只用标准库 urllib，无需额外安装
-#   * 质检图刻意用 OpenCV 渲染，不依赖 matplotlib（部分环境 matplotlib 会崩）
-#   * 拟合全部用闭式算术实现，不调用 LAPACK（规避部分环境 numpy.linalg 崩溃）
-#   * 测试脚本只用标准库，因此没有 requirements-dev.txt
+# 完整安装：提取算法、网页界面及可选 OCR（Python 3.10+）。
+-r requirements-core.txt
+-r requirements-web.txt
+-r requirements-ocr.txt

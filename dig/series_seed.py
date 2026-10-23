@@ -24,6 +24,7 @@
 import csv
 import math
 import re
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -178,7 +179,7 @@ def resolve_color(img, anchors, hint_hex=None, palette=()):
     """
     hint = _hex_to_bgr(hint_hex) if hint_hex else None
     if hint is not None and _hsv_of(hint)[1] < 40:
-        hint = None                       # 模型给了个灰白色，等于没给
+        return None, "dark" if _hsv_of(hint)[2] < 110 else "none"
     pal = [c for c in (_hex_to_bgr(p) for p in (palette or [])) if c is not None]
     pal = [c for c in pal if _hsv_of(c)[1] >= 40]
 
@@ -187,8 +188,11 @@ def resolve_color(img, anchors, hint_hex=None, palette=()):
 
     # 图例色块优先：它是从这张图上量出来的，比模型报的十六进制更准
     if pal and ref_hue is not None:
-        best = min(pal, key=lambda c: _hue_dist(_hsv_of(c)[0], ref_hue))
-        if _hue_dist(_hsv_of(best)[0], ref_hue) <= PALETTE_SNAP:
+        ranked = sorted(pal, key=lambda c: _hue_dist(_hsv_of(c)[0], ref_hue))
+        best = ranked[0]
+        dist = _hue_dist(_hsv_of(best)[0], ref_hue)
+        next_dist = _hue_dist(_hsv_of(ranked[1])[0], ref_hue) if len(ranked) > 1 else 180
+        if dist <= PALETTE_SNAP or (dist <= 32 and next_dist - dist >= 12):
             return best, "palette"
 
     measured = anchor_colors(img, anchors)
@@ -208,6 +212,20 @@ def resolve_color(img, anchors, hint_hex=None, palette=()):
     return None, "none"
 
 
+def pixel_palette(hsv, frame, exclude_boxes=()):
+    """Measure colours in this coordinate frame, excluding legend/inset pixels.
+
+    A shared legend may describe other panels. It is unsuitable as a colour
+    calibration source when those colours do not occur in the current plot.
+    """
+    local = hsv.copy()
+    for x, y, w, h in exclude_boxes:
+        local[max(0,y):y+h, max(0,x):x+w, 1] = 0
+    colours = [_hue_color(local, frame, hue, tol=5)
+               for hue in _dominant_hues(local, frame, min_share=.02)]
+    return ["#%02x%02x%02x" % (c[2], c[1], c[0]) for c in colours if c is not None]
+
+
 def hue_tolerances(colors, base=14, floor=4):
     """每条曲线自己的色相容差：颜色相近时收紧，免得两条线互相串色。
 
@@ -223,7 +241,8 @@ def hue_tolerances(colors, base=14, floor=4):
             continue
         hi = _hsv_of(c)[0]
         dists = [_hue_dist(hi, _hsv_of(o)[0])
-                 for j, o in enumerate(colors) if o is not None and j != i]
+                 for j, o in enumerate(colors) if o is not None and j != i
+                 and _hue_dist(hi, _hsv_of(o)[0]) > 2]
         out.append(int(max(floor, min(base, 0.45 * min(dists)))) if dists else base)
     return out
 
@@ -568,13 +587,25 @@ def flat_run_frac(trace, tol=1.0):
     pts = sorted(trace, key=lambda q: q[0])
     if len(pts) < 12:
         return 1.0
-    best = cur = 1
-    for i in range(1, len(pts)):
-        if abs(pts[i][1] - pts[i - 1][1]) <= tol:
-            cur += 1
-            best = max(best, cur)
-        else:
-            cur = 1
+    # The ENTIRE horizontal run must stay within a narrow vertical band. Comparing
+    # adjacent pixels alone classified every smooth curve with slope <1 px/column
+    # as a grid line, including ordinary slowly rising black model curves.
+    best,left = 1,0
+    minima,maxima = deque(),deque()
+    for i,(_x,y) in enumerate(pts):
+        while minima and pts[minima[-1]][1]>=y:
+            minima.pop()
+        while maxima and pts[maxima[-1]][1]<=y:
+            maxima.pop()
+        minima.append(i)
+        maxima.append(i)
+        while pts[maxima[0]][1]-pts[minima[0]][1]>2*tol:
+            left += 1
+            while minima[0]<left:
+                minima.popleft()
+            while maxima[0]<left:
+                maxima.popleft()
+        best = max(best,i-left+1)
     return best / float(len(pts))
 
 
@@ -600,24 +631,37 @@ def candidates_in_mask(mask, frame, anchors, allow_loop=False, reject_rules=Fals
             t = _trace_in_mask(g["mask"], frame, a)
             if t:
                 traces.append(t)
+        # Discover distinct branches even when they share a colour/component at
+        # their origin. A single greedy seed cannot enumerate their identities.
+        runs = _runs_by_column(g["mask"], frame)
+        for frac in (.25, .55, .85):
+            target = frame[0] + frac*(frame[2]-frame[0])
+            if runs:
+                x = min(runs, key=lambda x: abs(x-target))
+                for y,_ in runs[x][:12]:
+                    traces.append(_trace_in_mask(g["mask"], frame, (x,y)))
         traces.append(_trace_in_mask(g["mask"], frame, None))
         traces = [t for t in _dedupe(traces) if t]
         if not traces:
             continue
-        trace = max(traces, key=len)
-        if reject_rules and (is_rule(trace, frame)
+        def rank(t):
+            hits, distance = _anchor_stats(t, anchors)
+            return (hits, -(distance if distance is not None else 1e9), len(t))
+        for trace in sorted(traces,key=rank,reverse=True):
+            if reject_rules and (is_rule(trace, frame)
                              or is_rule_line(mask, trace, frame)
                              or flat_run_frac(trace) >= 0.4):
-            continue                       # 网格线/坐标框：不是数据
-        kind = "line"
-        if allow_loop and _looks_like_loop(g["mask"], frame) and _single_blob(g["mask"]):
-            loop = _contour_points(g["mask"], frame)
-            if len(loop) >= 20 and _encloses_area(g["mask"], loop):
-                trace, kind = loop, "loop"
-        hits, med = _anchor_stats(trace, anchors)
-        span = (max(p[0] for p in trace) - min(p[0] for p in trace)) / \
+                continue
+            kind = "line"
+            if allow_loop and _looks_like_loop(g["mask"], frame) and _single_blob(g["mask"]):
+                loop = _contour_points(g["mask"], frame)
+                if len(loop) >= 20 and _encloses_area(g["mask"], loop):
+                    trace, kind = loop, "loop"
+            hits, med = _anchor_stats(trace, anchors)
+            span = (max(p[0] for p in trace) - min(p[0] for p in trace)) / \
             max(1.0, frame[2] - frame[0])
-        cands.append({"trace": trace, "kind": kind, "key": g["key"], "npix": g["npix"],
+            fingerprint = tuple((int(x)//4,int(y)//4) for x,y in trace[::max(1,len(trace)//8)])
+            cands.append({"trace": trace, "kind": kind, "key": (g["key"],fingerprint), "npix": g["npix"],
                       "hits": hits, "med_dist": med, "span": round(span, 3)})
     if not cands:
         return []
@@ -667,6 +711,42 @@ def trace_in_mask(mask, frame, anchors, avoid=(), allow_loop=False, reject_rules
         info["reason"] = "掩膜里没有可用的线段（深色笔画都被判成坐标轴/文字了？）"
         return [], "none", info
     return pick["trace"], pick["kind"], info
+
+
+def measured_trace(trace, mask, near=3):
+    """Sparse stroke evidence; never interpolate across unobserved columns."""
+    h, w = mask.shape[:2]
+    out = {}
+    for x, y in trace:
+        ix, iy = int(round(x)), int(round(y))
+        if not (0 <= ix < w and 0 <= iy < h):
+            continue
+        lo, hi = max(0, iy - near), min(h, iy + near + 1)
+        hits = np.flatnonzero(mask[lo:hi, ix] > 0)
+        if hits.size:
+            out[ix] = float(lo + hits[np.argmin(abs(lo + hits - y))])
+    return out
+
+
+def retrace_from_anchors(trace, anchors, mask, frame, occluders=()):
+    """Model anchors direct a pixel search; they never become output data points."""
+    known = {int(round(x)): (float(x), float(y)) for x, y in trace}
+    runs = _runs_by_column(mask, frame)
+    fw, fh = max(1, frame[2] - frame[0]), max(1, frame[3] - frame[1])
+    radius = max(12, int(.035 * min(fw, fh)))
+    for ax, ay in anchors or []:
+        candidates = [(abs(x - ax) + abs(cy - ay), x, cy)
+                      for x, rr in runs.items() if abs(x - ax) <= radius
+                      for cy, _length in rr if abs(cy - ay) <= radius]
+        if not candidates:
+            continue
+        _distance, x, y = min(candidates)
+        fragment = _trace_in_mask(mask, frame, (x, y))
+        for px, py in fragment:
+            known.setdefault(int(round(px)), (float(px), float(py)))
+    merged = [known[x] for x in sorted(known)]
+    filled, info = complete_trace(merged, mask, frame, occluders)
+    return filled, info
 
 
 def trace_series(hsv, frame, color, anchors, exclude_boxes=(), hue_tol=14, avoid=(),
@@ -926,7 +1006,8 @@ def _follow_occluder(runs, occ, pts, direction, join_near=6.0, rejoin_near=6.0,
 
 
 def complete_trace(trace, mask, frame, occluders=(), max_jump=MAX_JUMP, max_gap=MAX_GAP,
-                   cover_need=0.6, max_bridge=None, max_total=None):
+                   cover_need=0.6, max_bridge=None, max_total=None,
+                   allow_endpoint_overlap=False):
     """把"压在别的曲线下面"的那几段补上 -> (新轨迹, 补全信息)。
 
     occluders 是 [(名字, dense_trace(另一条轨迹))]。补全信息会写进报告与质检图，
@@ -960,7 +1041,8 @@ def complete_trace(trace, mask, frame, occluders=(), max_jump=MAX_JUMP, max_gap=
                                       occluders, min(max_jump, 10.0), max_gap,
                                       min(max_bridge, max_total - total), cover_need)
             if not ext:
-                fol = _follow_occluder(runs, occluders, pts, direction)
+                fol = (_follow_occluder(runs, occluders, pts, direction)
+                       if allow_endpoint_overlap else None)
                 if fol is None:
                     break
                 (sx, _sy), (fx, fy), filler, how = fol
@@ -1015,6 +1097,18 @@ def complete_trace(trace, mask, frame, occluders=(), max_jump=MAX_JUMP, max_gap=
     return out, info
 
 
+def filled_marker_cores(mask):
+    """Compact thickness maxima; holes and chopped line fragments are not dots."""
+    distance=cv2.distanceTransform(mask,cv2.DIST_L2,5)
+    threshold=max(2.2,min(3.5,.65*float(distance.max())))
+    peaks=((distance>=threshold) &
+        (distance>=cv2.dilate(distance,np.ones((5,5),np.uint8))-1e-5)).astype(np.uint8)
+    count,labels,stats,centres=cv2.connectedComponentsWithStats(peaks)
+    limit=max(6,int(.04*min(mask.shape)))
+    return [(float(centres[i][0]),float(centres[i][1])) for i in range(1,count)
+            if max(stats[i,cv2.CC_STAT_WIDTH],stats[i,cv2.CC_STAT_HEIGHT])<=limit]
+
+
 def marker_centers(mask, min_markers=3):
     """Marker centres from a mask whose non-data regions were already excluded."""
     m = mask
@@ -1025,6 +1119,23 @@ def marker_centers(mask, min_markers=3):
     blobs = []
     h_img, w_img = mask.shape[:2]
     max_dim = max(12, int(0.08 * min(h_img, w_img)))
+    # Filled glyphs joined by a line/error bar are one eroded component. Local
+    # distance maxima still identify their individual centres without sampling
+    # the surrounding line as if it were a series of data markers.
+    distance = cv2.distanceTransform(m, cv2.DIST_L2, 5)
+    glyph_radius = max(3.8, .65 * float(distance.max()))
+    peaks = ((distance >= glyph_radius) &
+             (distance >= cv2.dilate(distance, np.ones((7, 7), np.uint8)) - 1e-5)).astype(np.uint8)
+    pn, _pl, ps, pc = cv2.connectedComponentsWithStats(peaks)
+    for i in range(1, pn):
+        x, y, bw, bh, area = ps[i]
+        if max(bw, bh) > max_dim:
+            continue
+        cx, cy = pc[i]
+        radius = float(distance[int(round(cy)), int(round(cx))])
+        blobs.append({"cx": float(cx), "cy": float(cy), "w": max(bw, int(2 * radius)),
+                      "h": max(bh, int(2 * radius)), "area": max(3, int(radius * radius))})
+    filled_found = len(blobs) >= min_markers
     for i in range(1, n):
         if stats[i, cv2.CC_STAT_AREA] < 3:
             continue
@@ -1035,6 +1146,51 @@ def marker_centers(mask, min_markers=3):
         blobs.append({"cx": float(cents[i][0]), "cy": float(cents[i][1]),
                       "w": bw, "h": bh,
                       "area": int(stats[i, cv2.CC_STAT_AREA])})
+    # Hollow circles/triangles disappear under erosion. Their enclosed white holes
+    # survive even when connecting lines join all outlines into one component.
+    contours, hierarchy = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    # Partly covered hollow glyphs are no longer closed holes. Compact outer
+    # components still expose their silhouette; small dash strokes do not qualify.
+    for contour in contours:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        hull_area = abs(cv2.contourArea(cv2.convexHull(contour)))
+        if (min(bw, bh) >= 8 and max(bw, bh) <= max_dim
+                and max(bw, bh) <= 2.0 * min(bw, bh) and hull_area >= .45 * bw * bh):
+            blobs.append({"cx": x + (bw - 1) / 2, "cy": y + (bh - 1) / 2,
+                          "w": bw, "h": bh, "area": max(3, int(.3 * hull_area))})
+    if hierarchy is not None and not filled_found:
+        for idx, contour in enumerate(contours):
+            if hierarchy[0][idx][3] < 0:
+                continue
+            x, y, bw, bh = cv2.boundingRect(contour)
+            area = abs(cv2.contourArea(contour))
+            if not (4 <= bw <= max_dim and 4 <= bh <= max_dim
+                    and max(bw, bh) <= 2.2 * min(bw, bh)
+                    and area >= .25 * bw * bh):
+                continue
+            mom = cv2.moments(contour)
+            if not mom["m00"]:
+                continue
+            cx, cy = mom["m10"] / mom["m00"], mom["m01"] / mom["m00"]
+            if any(abs(b["cx"] - cx) <= 3 and abs(b["cy"] - cy) <= 3 for b in blobs):
+                continue
+            blobs.append({"cx": float(cx), "cy": float(cy), "w": bw, "h": bh,
+                          "area": max(3, int(.3 * area))})
+    # A connecting line can split a hollow glyph into two enclosed half-holes.
+    # Combine those local detections before treating them as separate samples.
+    clustered = []
+    for blob in sorted(blobs, key=lambda b: b["cx"]):
+        match = next((b for b in clustered if math.hypot(b["cx"] - blob["cx"], b["cy"] - blob["cy"])
+                      <= max(4, .75 * max(b["w"], b["h"], blob["w"], blob["h"]))), None)
+        if match is None:
+            clustered.append(dict(blob, detections=1))
+        else:
+            n = match["detections"]
+            match["cx"] = (n * match["cx"] + blob["cx"]) / (n + 1)
+            match["cy"] = (n * match["cy"] + blob["cy"]) / (n + 1)
+            match["detections"] += 1
+            match["area"] = max(match["area"], blob["area"])
+    blobs = clustered
     if len(blobs) < min_markers:
         return []
     areas = np.array([b["area"] for b in blobs], float)
@@ -1044,7 +1200,188 @@ def marker_centers(mask, min_markers=3):
     return [(b["cx"], b["cy"]) for b in keep]
 
 
-def best_marker_track(points, frame, min_points=4, min_extent_frac=0.15):
+def markers_near_anchors(points, anchors, frame, tolerance=.08):
+    """Disambiguate same-colour marker/line instances using coarse panel seeds."""
+    if len(anchors or []) < 2:
+        return list(points)
+    guide = sorted((float(x), float(y)) for x, y in anchors)
+    half = max(12., tolerance * (frame[3] - frame[1]))
+    out = []
+    for x, y in points:
+        if x < guide[0][0] or x > guide[-1][0]:
+            endpoint = guide[0] if x < guide[0][0] else guide[-1]
+            if abs(x - endpoint[0]) > .12 * (frame[2] - frame[0]):
+                continue
+            expected = endpoint[1]
+        else:
+            expected = float(np.interp(x, [a[0] for a in guide], [a[1] for a in guide]))
+        if abs(y - expected) <= half:
+            out.append((x, y))
+    return out
+
+
+def mask_near_anchors(mask, anchors, frame, tolerance=.20):
+    """Restrict ambiguous same-colour instances to a broad semantic corridor."""
+    if len(anchors or []) < 3:
+        return mask
+    guide = sorted((float(x), float(y)) for x,y in anchors)
+    if guide[-1][0] - guide[0][0] < .5 * (frame[2] - frame[0]):
+        return mask
+    ys = np.interp(np.arange(mask.shape[1]), [a[0] for a in guide], [a[1] for a in guide])
+    half = max(24., tolerance * (frame[3] - frame[1]))
+    keep = abs(np.arange(mask.shape[0])[:,None] - ys[None,:]) <= half
+    return np.where(keep, mask, 0).astype(np.uint8)
+
+
+def soft_guided_trace(mask, anchors, frame, beam_size=12, max_gap=90):
+    """Global pixel paths with soft semantic guidance and a slope memory.
+
+    Unlike a greedy nearest-run walk, multiple hypotheses survive crossings and
+    dash gaps. Anchors influence costs; all returned points are actual run centres.
+    Missing columns remain missing rather than becoming invented observations.
+    """
+    if len(anchors or []) < 3:
+        return []
+    guide = sorted((float(x),float(y)) for x,y in anchors)
+    fw, fh = max(1.,frame[2]-frame[0]), max(1.,frame[3]-frame[1])
+    if guide[-1][0]-guide[0][0] < .4*fw:
+        return []
+    runs = _runs_by_column(mask,frame)
+    states, best = [], None
+    # Nodes are linked to avoid repeatedly copying hundreds of prefix points.
+    for x in sorted(runs):
+        expected = float(np.interp(x,[a[0] for a in guide],[a[1] for a in guide]))
+        proposals = []
+        for y,_width in runs[x]:
+            guide_cost = .5 * min(16.,((y-expected)/(.12*fh))**2)
+            if abs(x-guide[0][0]) <= .10*fw:
+                proposals.append((1.-guide_cost,x,float(y),None,(x,float(y),None)))
+            for score,px,py,slope,node in states:
+                dx,dy = x-px,float(y)-py
+                if dx <= 0 or dx > max_gap or abs(dy) > 12.+2.*dx:
+                    continue
+                velocity = dy/dx
+                bend = abs(velocity-slope) if slope is not None else 0.
+                value = score + 1. - guide_cost - .12*min(bend,8.) - .10*(dx-1)
+                proposals.append((value,x,float(y),velocity if slope is None else .7*slope+.3*velocity,
+                                  (x,float(y),node)))
+        # Keep gap hypotheses alive while avoiding near-identical paths taking all
+        # beam slots. The comparison includes the cost of skipped columns.
+        candidates = proposals + [s for s in states if x-s[1] < max_gap]
+        kept = []
+        for state in sorted(candidates,key=lambda s:s[0]-.10*(x-s[1]),reverse=True):
+            if any(abs(state[2]-s[2]) < 3 and abs(state[1]-s[1]) < 3 for s in kept):
+                continue
+            kept.append(state)
+            if len(kept) >= beam_size:
+                break
+        states = kept
+        for state in proposals:
+            if best is None or state[0] > best[0]:
+                best = state
+    if best is None:
+        return []
+    out,node = [],best[4]
+    while node is not None:
+        x,y,node = node
+        out.append((float(x),float(y)))
+    return out[::-1]
+
+
+def shape_marker_centers(mask, shape, frame, hollow=None, threshold=.70, occlusion_mask=None):
+    """Recognize glyph silhouettes even when another colour opens their outlines.
+
+    Matching scores use only actual foreground pixels. Candidate centres are tied
+    to a fitted glyph, never to a model-proposed numerical data point.
+    """
+    if shape not in {"circle", "square", "diamond", "triangle", "star"}:
+        return []
+    left, top, right, bottom = [int(v) for v in frame]
+    # Rasterized PDFs frequently contain genuine filled glyphs only 4-6 px wide.
+    # The old 4 px minimum radius made an entire black experimental series vanish.
+    min_r = max(2, int(.004 * (bottom - top)))
+    max_r = min(24, max(min_r + 2, int(.04 * (bottom - top))))
+    source = (mask[top:bottom + 1, left:right + 1] > 0).astype(np.float32)
+    own_source = source
+    use_occlusion = occlusion_mask is not None and (hollow is True or (hollow is False and shape=='square'))
+    if use_occlusion:
+        source = np.maximum(source,(occlusion_mask[top:bottom+1,left:right+1]>0).astype(np.float32))
+    if source.size == 0:
+        return []
+    candidates = []
+    for radius in range(min_r, max_r + 1):
+        size = 2 * radius + 5
+        if min(source.shape) <= size:
+            continue
+        centre = radius + 2
+        for fill in ([False] if hollow is True else [True] if hollow is False else [False, True]):
+            for thickness in ([1, 2, 3] if not fill else [-1]):
+                template = np.zeros((size, size), np.uint8)
+                if shape == "circle":
+                    cv2.circle(template, (centre, centre), radius, 1, thickness)
+                elif shape == "square":
+                    cv2.rectangle(template, (centre-radius, centre-radius),
+                                  (centre+radius, centre+radius), 1, thickness)
+                else:
+                    if shape == "diamond":
+                        vertices = [(centre, centre-radius), (centre+radius, centre),
+                                    (centre, centre+radius), (centre-radius, centre)]
+                    elif shape == "triangle":
+                        vertices = [(centre, centre-radius), (centre+radius, centre+radius),
+                                    (centre-radius, centre+radius)]
+                    else:
+                        vertices = [(centre + int(round(radius * (1 if k % 2 == 0 else .42) * math.cos(-math.pi/2+k*math.pi/5))),
+                                     centre + int(round(radius * (1 if k % 2 == 0 else .42) * math.sin(-math.pi/2+k*math.pi/5))))
+                                    for k in range(10)]
+                    pts = np.array(vertices, np.int32)
+                    if fill:
+                        cv2.fillPoly(template, [pts], 1)
+                    else:
+                        cv2.polylines(template, [pts], True, 1, thickness)
+                score = cv2.matchTemplate(source, template.astype(np.float32), cv2.TM_CCORR_NORMED)
+                peaks = (score >= threshold) & (score >= cv2.dilate(score, np.ones((5,5),np.uint8)) - 1e-6)
+                if use_occlusion:
+                    # Other visible ink may complete an occluded silhouette, but a
+                    # quarter of its outline must still belong to this series.
+                    # A neighbouring glyph alone cannot fabricate a hidden marker.
+                    evidence_template = (template if not fill else
+                        template-cv2.erode(template,np.ones((3,3),np.uint8)))
+                    own_ink = cv2.matchTemplate(own_source,evidence_template.astype(np.float32),cv2.TM_CCORR)
+                    peaks &= own_ink >= .25*float(evidence_template.sum())
+                ys, xs = np.where(peaks)
+                for y,x in zip(ys,xs):
+                    if use_occlusion:
+                        own_patch = own_source[y:y+size,x:x+size]
+                        visible = own_patch*evidence_template
+                        vy,vx = np.where(visible>.5)
+                        if len(vx) < 8:
+                            continue
+                        dx,dy = vx-vx.mean(),vy-vy.mean()
+                        a,b,c = float(np.mean(dx*dx)),float(np.mean(dx*dy)),float(np.mean(dy*dy))
+                        spread = math.hypot(a-c,2*b)
+                        minor,major = (a+c-spread)/2.,(a+c+spread)/2.
+                        if minor < .12*max(1.,major):
+                            continue  # A straight dash is not a visible glyph arc.
+                        if fill and shape=='square':
+                            # A same-colour model line passing behind another
+                            # series' square is not evidence of a square of its own.
+                            # Require a visible corner: one substantial horizontal
+                            # side and one vertical side belonging to this series.
+                            lo,hi = centre-radius,centre+radius
+                            horizontal = max(own_patch[lo,lo:hi+1].mean(),own_patch[hi,lo:hi+1].mean())
+                            vertical = max(own_patch[lo:hi+1,lo].mean(),own_patch[lo:hi+1,hi].mean())
+                            if not (max(horizontal,vertical)>=.65 and min(horizontal,vertical)>=.3):
+                                continue
+                    candidates.append((float(score[y,x]),left+x+centre,top+y+centre,radius))
+    kept = []
+    for score, x, y, radius in sorted(candidates, reverse=True):
+        if any(math.hypot(x-a, y-b) < .8 * (radius + r) for _s,a,b,r in kept):
+            continue
+        kept.append((score,x,y,radius))
+    return sorted((float(x),float(y)) for _s,x,y,_r in kept)
+
+
+def best_marker_track(points, frame, min_points=4, min_extent_frac=0.15, anchors=()):
     """Pick one smooth left-to-right data trajectory from marker centres.
 
     Legends and annotations often contain one glyph with exactly the same colour and
@@ -1062,6 +1399,17 @@ def best_marker_track(points, frame, min_points=4, min_extent_frac=0.15):
             continue
         pts.append((x, y))
     n = len(pts)
+    supported = [(float(x),float(y)) for x,y in anchors or []
+                 if min(math.hypot(x-a,y-b) for a,b in pts) <= .15*min(fw,fh)]
+    supported.sort()
+    node_cost = []
+    for x,y in pts:
+        expected = float(np.interp(x,[a[0] for a in supported],[a[1] for a in supported])) if supported else y
+        influence = max((math.exp(-.5*((x-ax)/(.08*fw))**2) for ax,ay in supported),default=0.)
+        if len(supported) >= 3:
+            influence = max(.4,influence)
+        cost = .8*min(16.,((y-expected)/(.10*fh))**2)*influence
+        node_cost.append(cost)
     min_dx, max_dx = 0.004 * fw, 0.20 * fw
     states = {}
     for i in range(n):
@@ -1071,7 +1419,7 @@ def best_marker_track(points, frame, min_points=4, min_extent_frac=0.15):
                 continue
             if abs(pts[j][1] - pts[i][1]) > max(0.22 * fh, 4.0 * dx):
                 continue
-            states[(i, j)] = (4.0 + 0.25 * dx / fw, [i, j])
+            states[(i, j)] = (6.0 + 0.25 * dx / fw-node_cost[i]-node_cost[j], [i, j])
     for j in range(1, n):
         incoming = [(key, val) for key, val in states.items() if key[1] == j]
         for (i, _j), (score, path) in incoming:
@@ -1088,7 +1436,8 @@ def best_marker_track(points, frame, min_points=4, min_extent_frac=0.15):
                 if s1 * s2 < 0 and min(abs(s1), abs(s2)) > 0.15:
                     penalty += 3.0
                 penalty += 0.25 * max(0.0, dx2 / (0.08 * fw) - 1.0)
-                new_score = score + 2.4 - penalty
+                reward = 3.4*min(1.,dx2/(.04*fw))
+                new_score = score + reward - penalty-node_cost[k]
                 old = states.get((j, k))
                 if old is None or new_score > old[0]:
                     states[(j, k)] = (new_score, path + [k])
@@ -1097,9 +1446,73 @@ def best_marker_track(points, frame, min_points=4, min_extent_frac=0.15):
               and pts[path[-1]][0] - pts[path[0]][0] >= min_extent_frac * fw]
     if not viable:
         return []
-    _score, path = max(viable, key=lambda v: (v[0], len(v[1]),
-                                              pts[v[1][-1]][0] - pts[v[1][0]][0]))
-    return [pts[i] for i in path]
+    def rank(value):
+        score,path = value
+        track = np.array([pts[i] for i in path])
+        # Compare whole measured tracks. A straight interpolated corridor would
+        # discard the middle of a concave curve even when its endpoints are clear.
+        penalty = sum(min(6.,float(np.min(np.hypot(track[:,0]-x,track[:,1]-y)))
+                          /max(12.,.08*min(fw,fh))) for x,y in anchors or [])
+        extent = pts[path[-1]][0]-pts[path[0]][0]
+        return (score-12.*penalty+6.*extent/fw,len(path),extent)
+    _score, path = max(viable,key=rank)
+    track = [pts[i] for i in path]
+    # The global path identifies the instance, but centre noise can make skipping
+    # alternate dense glyphs score slightly better. Reinsert measured candidates
+    # lying on its local track; interpolated y is only a gate, never output data.
+    # Keep the endpoints and instance identity established above.
+    supplement = []
+    for x,y in pts:
+        if not track[0][0]<x<track[-1][0] or any(abs(x-a)<min_dx for a,b in track):
+            continue
+        expected = float(np.interp(x,[a for a,b in track],[b for a,b in track]))
+        if abs(y-expected)<=max(.6,.008*min(fw,fh)):
+            supplement.append((x,y))
+    return sorted(track+supplement)
+
+
+def extend_vertical_markers(track, candidates, frame):
+    """Keep measured glyphs on near-vertical branches of a scatter trajectory.
+
+    A y(x) dynamic program cannot represent several glyphs at the same x. Start
+    from its identified instance and grow through nearby glyphs in two dimensions;
+    never interpolate new observations or attach a distant second trajectory.
+    """
+    if len(track) < 3:
+        return list(track)
+    fw, fh = frame[2]-frame[0], frame[3]-frame[1]
+    out = list(track)
+    terminal_start = max(x for x,y in track) - .08*fw
+    pending = [(float(x), float(y)) for x,y in candidates
+               if x >= terminal_start
+               if not any(np.hypot(x-a,y-b)<2 for a,b in out)]
+    frontier = list(out)
+    while frontier:
+        x,y = frontier.pop()
+        found = [(a,b) for a,b in pending
+                 if abs(a-x) <= max(4., .04*fw)
+                 and abs(b-y) >= .8*abs(a-x)
+                 and np.hypot(a-x,b-y) <= max(12., .065*fh)]
+        for p in found:
+            pending.remove(p);out.append(p);frontier.append(p)
+    return sorted(out)
+
+
+def without_marker_glyphs(mask, centres):
+    """Remove competing measured glyphs before following a same-colour line.
+
+    Removing the local disk can leave a short genuine occlusion. The tracer must
+    rejoin visible line pixels on the other side, rather than follow marker rims.
+    """
+    out = mask.copy()
+    distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    for x,y in centres:
+        ix,iy = int(round(x)),int(round(y))
+        if not (0 <= ix < mask.shape[1] and 0 <= iy < mask.shape[0]):
+            continue
+        radius = min(16, max(4, int(np.ceil(distance[iy,ix]))+2))
+        cv2.circle(out,(ix,iy),radius,0,-1)
+    return out
 
 
 def markers_in_mask(mask, trace, half=22, min_markers=3):
