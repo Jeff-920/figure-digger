@@ -1,0 +1,418 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge, empty_state, file_picker, paper_table %}
+{% block title %}{{ view.label }} · 任务详情{% endblock %}
+{% block content %}
+<div class="detail-head">
+  <div class="detail-heading">
+    <a class="back-link" href="{{ url_for('main.index') }}">
+      <i class="fa-solid fa-arrow-left" aria-hidden="true"></i> 返回任务结果
+    </a>
+    <div class="detail-title-row">
+      <h1 class="page-title" title="{{ view.label }}">{{ view.file_summary }}</h1>
+      {{ status_badge(view.state, 'status-badge-lg') }}
+    </div>
+    <p class="run-meta">
+      任务 <span class="mono">{{ view.run_id }}</span>
+      · {{ view.created|clock }}
+      · {{ view.mode }}
+      · {{ view.paper_count }} 篇文献
+    </p>
+    <p class="run-want"><i class="fa-solid fa-bullseye" aria-hidden="true"></i> 提取目标：{{ view.want }}</p>
+  </div>
+  <div class="detail-actions">
+    {% if view.result_total %}
+    <a class="btn btn-primary" href="{{ url_for('main.download_archive', run_id=view.run_id) }}" data-busy>
+      <i class="fa-solid fa-file-zipper" aria-hidden="true"></i> <span>下载全部结果</span>
+    </a>
+    {% endif %}
+  </div>
+</div>
+
+{% if scope_paper %}
+<div class="scope-bar">
+  <div class="scope-main">
+    <i class="fa-solid fa-file-circle-check" aria-hidden="true"></i>
+    <span>当前文献</span>
+    <strong class="mono">{{ scope_paper.name }}</strong>
+    {{ status_badge(scope_paper.state, compact=True) }}
+    <span class="scope-meta">
+      {% if scope_paper.pages %}{{ scope_paper.pages }} 页 · {% endif %}
+      CSV {{ scope_counts.csv }} · 核对图 {{ scope_counts.images }} · 报告 {{ scope_counts.reports }}
+    </span>
+    {% if scope_paper.error %}
+    <span class="paper-error" title="{{ scope_paper.error }}">{{ scope_paper.error }}</span>
+    {% endif %}
+  </div>
+  <a class="btn btn-sm btn-outline-secondary"
+     href="{{ url_for('main.run_detail', run_id=view.run_id, tab='papers') }}">
+    <i class="fa-solid fa-list-check" aria-hidden="true"></i> 查看全部文献
+  </a>
+</div>
+{% endif %}
+
+{% if view.batch_failures %}
+<div class="alert alert-warning" role="alert">
+  <p class="mb-2"><i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+    <strong>{% if view.failed_paper_count == view.paper_count %}所有文献处理失败：{% else %}部分文献处理失败：{% endif %}</strong></p>
+  <ul class="mb-2">
+    {% for name in view.batch_failures %}<li>{{ name }}</li>{% endfor %}
+  </ul>
+  <p class="mb-0 small">总体命令可能以成功退出，但上述文件没有完成；已有结果仍需核对。</p>
+</div>
+{% elif view.state.key in ['failed', 'interrupted', 'analyze', 'empty'] %}
+<div class="alert alert-{% if view.state.key == 'failed' %}danger{% elif view.state.key == 'interrupted' %}warning{% else %}info{% endif %}" role="alert">
+  <i class="fa-solid {{ view.state.icon }}" aria-hidden="true"></i> {{ view.state.detail }}
+</div>
+{% endif %}
+
+<div class="metrics-grid">
+  <div class="metric-card">
+    <span class="metric-label"><i class="fa-solid fa-file-circle-check" aria-hidden="true"></i> {% if scope_paper %}当前文献{% else %}文献{% endif %}</span>
+    <strong class="metric-value">{% if scope_paper %}1{% else %}{{ view.paper_count }}{% endif %}</strong>
+  </div>
+  <div class="metric-card">
+    <span class="metric-label"><i class="fa-solid fa-table" aria-hidden="true"></i> CSV 文件</span>
+    <strong class="metric-value">{{ scope_counts.csv }}</strong>
+  </div>
+  <div class="metric-card">
+    <span class="metric-label"><i class="fa-solid fa-images" aria-hidden="true"></i> 核对图</span>
+    <strong class="metric-value">{{ scope_counts.images }}</strong>
+  </div>
+  <div class="metric-card">
+    <span class="metric-label"><i class="fa-solid fa-file-lines" aria-hidden="true"></i> 报告</span>
+    <strong class="metric-value">{{ scope_counts.reports }}</strong>
+  </div>
+  <div class="metric-card">
+    <span class="metric-label"><i class="fa-solid fa-stopwatch" aria-hidden="true"></i> 耗时</span>
+    <strong class="metric-value">{% if view.active %}<span id="run-elapsed">{{ elapsed_display }}</span>{% else %}{{ view.elapsed|duration }}{% endif %}</strong>
+  </div>
+</div>
+
+{% if view.active %}
+<section class="surface live-card" aria-labelledby="liveTitle">
+  <div class="live-head">
+    <h2 id="liveTitle"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> 任务正在后台运行</h2>
+    <span class="surface-meta">状态与日志会自动更新</span>
+  </div>
+  <div class="live-body">
+    <p class="live-hint" id="log-hint">日志每 1.5 秒更新一次；任务结束后页面自动刷新一次。</p>
+    <p class="live-error d-none" id="log-error" role="status"></p>
+    <pre class="log-view" id="run-log"
+         data-status-url="{{ url_for('main.run_status', run_id=view.run_id) }}"
+         data-active="true">{{ log_text or '等待处理程序输出…' }}</pre>
+  </div>
+</section>
+{% endif %}
+
+<section class="surface tabs-card" aria-labelledby="resultTabs">
+  <h2 class="visually-hidden" id="resultTabs">任务结果</h2>
+  <nav class="detail-tabs" aria-label="任务结果分类">
+    {% for tab in tabs %}
+    <a class="nav-link{% if active_tab == tab.key %} active{% endif %}"
+       href="{{ url_for('main.run_detail', run_id=view.run_id, tab=tab.key, paper=scope_paper.scope) if scope_paper and scope_paper.scope else url_for('main.run_detail', run_id=view.run_id, tab=tab.key) }}">
+      <i class="fa-solid {{ tab.icon }}" aria-hidden="true"></i> {{ tab.label }}
+      {% if tab.count %}<span class="tab-count">{{ tab.count }}</span>{% endif %}
+    </a>
+    {% endfor %}
+  </nav>
+
+  <div class="tab-body">
+    {% if active_tab == 'papers' %}
+      <div class="papers-panel papers-panel-detail">
+        <div class="papers-panel-head">
+          <span><i class="fa-solid fa-file-circle-check" aria-hidden="true"></i>
+            按文献核对 · {{ view.paper_count }} 篇{% if view.failed_paper_count %}
+            · {{ view.failed_paper_count }} 篇失败{% endif %}</span>
+          <span class="text-muted small">结果文件按文献保存在各自子目录</span>
+        </div>
+        {{ paper_table(view.papers, view.run_id) }}
+        <p class="hint">在“图像核对”“曲线数据”标签中可按文件选择到具体文献；全部结果也可下载 ZIP。</p>
+      </div>
+
+    {% elif active_tab == 'images' %}
+      {{ file_picker(view, 'images', file_options, selected_rel, '选择核对图', scope_paper.scope if scope_paper else '') }}
+      {% if selected_rel and chart_data %}
+      <div class="review-split">
+        <div class="review-current">
+      <div class="editor-steps" aria-label="使用步骤">
+        <span><b>1</b> 选起点</span>
+        <i class="fa-solid fa-chevron-right step-arrow" aria-hidden="true"></i>
+        <span><b>2</b> 调分辨率</span>
+        <i class="fa-solid fa-chevron-right step-arrow" aria-hidden="true"></i>
+        <span><b>3</b> 移动/擦除/补充</span>
+        <i class="fa-solid fa-chevron-right step-arrow" aria-hidden="true"></i>
+        <span><b>4</b> 确认绘制</span>
+        <i class="fa-solid fa-chevron-right step-arrow" aria-hidden="true"></i>
+        <span><b>5</b> 保存</span>
+      </div>
+      <div class="chart-workbench">
+        <div class="chart-tools" role="toolbar" aria-label="点编辑工具">
+          <button class="chart-tool active" type="button" data-tool="start" title="设置计算起点">
+            <i class="fa-solid fa-location-crosshairs" aria-hidden="true"></i><span>起点</span>
+          </button>
+          <button class="chart-tool" type="button" data-tool="move" title="拖动数据点">
+            <i class="fa-solid fa-up-down-left-right" aria-hidden="true"></i><span>移动</span>
+          </button>
+          <button class="chart-tool" type="button" data-tool="erase" title="擦除数据点并断开折线">
+            <i class="fa-solid fa-eraser" aria-hidden="true"></i><span>擦除</span>
+          </button>
+          <button class="chart-tool" type="button" data-tool="add" title="补充数据点并连接左右折线">
+            <i class="fa-solid fa-plus" aria-hidden="true"></i><span>补充</span>
+          </button>
+          <span class="chart-tool-sep" aria-hidden="true"></span>
+          <button class="chart-tool" type="button" id="chartNewCurve" title="新建一条未识别的曲线">
+            <i class="fa-solid fa-bezier-curve" aria-hidden="true"></i><span>新曲线</span>
+          </button>
+          <button class="chart-tool" type="button" id="chartFinishCurve" disabled title="结束新曲线绘制">
+            <i class="fa-solid fa-check" aria-hidden="true"></i><span>完成</span>
+          </button>
+          <span class="chart-tool-sep" aria-hidden="true"></span>
+          <button class="chart-tool" type="button" id="chartUndo" disabled title="撤销上一步编辑">
+            <i class="fa-solid fa-rotate-left" aria-hidden="true"></i><span>撤销</span>
+          </button>
+          <button class="chart-tool" type="button" id="chartResetEdits" disabled title="还原全部编辑">
+            <i class="fa-solid fa-clock-rotate-left" aria-hidden="true"></i><span>还原</span>
+          </button>
+          <button class="chart-tool" type="button" id="chartSave" disabled title="保存并覆盖修正后的 CSV">
+            <i class="fa-solid fa-floppy-disk" aria-hidden="true"></i><span>保存</span>
+          </button>
+          <button class="chart-tool" type="button" id="chartExport" disabled title="导出当前系列修正 CSV">
+            <i class="fa-solid fa-download" aria-hidden="true"></i><span>导出</span>
+          </button>
+        </div>
+        <div class="chart-main">
+          <div class="chart-toolbar">
+            <div class="chart-legend" id="chartLegend" aria-label="曲线图例"></div>
+            <div class="chart-resolution">
+              <label for="chartResolution">分辨率（采样间隔）</label>
+              <span class="res-edge">稀疏</span>
+              <input type="range" id="chartResolution" min="0" max="100" value="100"
+                     step="1" disabled aria-label="数据点采样间隔">
+              <span class="res-edge">密集</span>
+              <span class="resolution-value" id="chartResolutionValue">未选择起点</span>
+            </div>
+          </div>
+          <p class="chart-hint" id="chartHint">
+            <i class="fa-solid fa-hand-pointer" aria-hidden="true"></i>
+            点击图中任意数据点作为起点；随后拖动采样间隔，查看折线点的变化。
+          </p>
+          <div class="chart-stage" id="chartStage" data-run-id="{{ view.run_id }}">
+            <img src="{{ chart_data.image }}" alt="核对图：{{ selected_rel }}" draggable="false">
+            <svg id="chartOverlay" viewBox="0 0 {{ chart_data.width }} {{ chart_data.height }}"
+                 role="img" aria-label="可交互的提取点核对图"></svg>
+          </div>
+          <div class="chart-foot">
+            <span id="chartSelection">起点：未选择</span>
+            <span class="chart-edit-status" id="chartEditStatus">未修改</span>
+            <span class="chart-foot-actions">
+              <button class="btn btn-sm btn-outline-secondary" type="button" id="chartReset" disabled>
+                <i class="fa-solid fa-rotate-left" aria-hidden="true"></i> 清除起点
+              </button>
+              <a class="btn btn-sm btn-outline-secondary"
+                 href="{{ url_for('main.download_artifact', run_id=view.run_id, artifact_path=selected_rel) }}"
+                 target="_blank" rel="noopener">
+                <i class="fa-solid fa-up-right-from-square" aria-hidden="true"></i> 查看原核对图
+              </a>
+            </span>
+          </div>
+          <p class="hint">先点起点并确定采样间隔，后续移动/擦除/补充只作用于这批采样点。保存会覆盖当前文献中修改过的 CSV；新建曲线会追加一条 CSV。</p>
+          <div class="chart-loupe" id="chartLoupe" hidden aria-hidden="true">
+            <canvas id="chartLoupeCanvas" width="164" height="164"></canvas>
+            <span class="loupe-zoom">3×</span>
+          </div>
+        </div>
+      </div>
+        </div>
+        <aside class="review-plot">
+          <div class="plot-panel">
+            <div class="plot-head">
+              <div>
+                <h2 class="section-title">曲线成图</h2>
+                <p class="hint">左侧完成操作后，确认绘制右侧成图。</p>
+              </div>
+              <button class="btn btn-primary btn-sm" type="button" id="plotConfirm">
+                <i class="fa-solid fa-chart-line" aria-hidden="true"></i> 确认绘制
+              </button>
+            </div>
+            <div class="clean-plot" id="cleanPlot">
+              <div class="plot-placeholder">
+                <i class="fa-solid fa-chart-line" aria-hidden="true"></i>
+                <p>完成左侧采样或修改后，点击“确认绘制”。</p>
+              </div>
+            </div>
+            <div class="plot-labels">
+              <div class="axis-setting">
+                <label>X 轴标签
+                  <input class="form-control form-control-sm" type="text" id="plotXLabel"
+                         value="{{ chart_data.x_label }}" autocomplete="off">
+                </label>
+                <div class="axis-convert">
+                  <label title="单位换算倍率">× <input class="form-control form-control-sm" type="number"
+                                  id="plotXFactor" value="1" step="any" inputmode="decimal"></label>
+                  <label title="单位换算偏移">+ <input class="form-control form-control-sm" type="number"
+                                  id="plotXOffset" value="0" step="any" inputmode="decimal"></label>
+                </div>
+              </div>
+              <div class="axis-setting">
+                <label>Y 轴标签
+                  <input class="form-control form-control-sm" type="text" id="plotYLabel"
+                         value="{{ chart_data.y_label }}" autocomplete="off">
+                </label>
+                <div class="axis-convert">
+                  <label title="单位换算倍率">× <input class="form-control form-control-sm" type="number"
+                                  id="plotYFactor" value="1" step="any" inputmode="decimal"></label>
+                  <label title="单位换算偏移">+ <input class="form-control form-control-sm" type="number"
+                                  id="plotYOffset" value="0" step="any" inputmode="decimal"></label>
+                </div>
+              </div>
+            </div>
+            <p class="plot-status" id="plotStatus">倍率/偏移用于右侧成图和保存 CSV；左侧仍为原图坐标。×1 +0 表示不换算。</p>
+          </div>
+        </aside>
+      </div>
+      <script type="application/json" id="chartData">{{ chart_data|tojson }}</script>
+      {% elif selected_rel %}
+      <figure class="image-review">
+        <img src="{{ url_for('main.download_artifact', run_id=view.run_id, artifact_path=selected_rel) }}"
+             alt="提取结果核对图：{{ selected_rel }}">
+        <figcaption>
+          <span class="mono">{{ selected_rel }}</span>
+          <a class="btn btn-sm btn-outline-secondary"
+             href="{{ url_for('main.download_artifact', run_id=view.run_id, artifact_path=selected_rel) }}"
+             target="_blank" rel="noopener">
+            <i class="fa-solid fa-up-right-from-square" aria-hidden="true"></i> 查看原尺寸
+          </a>
+        </figcaption>
+      </figure>
+      <p class="hint">该面板没有可用的逐点数据或原始面板图，当前显示静态核对图。请检查提取点是否贴合原曲线。</p>
+      {% else %}
+        {{ empty_state('fa-images', '暂无核对图', '提取完成后，这里会显示曲线数据重投影到原图的核对图。') }}
+      {% endif %}
+
+    {% elif active_tab == 'csv' %}
+      {{ file_picker(view, 'csv', file_options, selected_rel, '选择数据文件', scope_paper.scope if scope_paper else '') }}
+      {% if selected_rel %}
+        <div class="preview-toolbar">
+          <span class="file-caption mb-0"><i class="fa-solid fa-table" aria-hidden="true"></i>
+            <span class="mono">{{ selected_rel }}</span></span>
+          <a class="btn btn-sm btn-primary"
+             href="{{ url_for('main.download_artifact', run_id=view.run_id, artifact_path=selected_rel, download=1) }}">
+            <i class="fa-solid fa-download" aria-hidden="true"></i> 下载当前 CSV
+          </a>
+        </div>
+        {% if preview_error %}
+        <div class="alert alert-warning" role="alert">{{ preview_error }}</div>
+        {% elif csv_header %}
+          <div class="table-responsive csv-preview">
+            <table class="table table-sm table-striped align-middle">
+              <thead>
+                <tr>
+                  {% for cell in csv_header %}<th scope="col">{{ cell }}</th>{% endfor %}
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in csv_rows %}
+                <tr>
+                  {% for cell in row %}<td>{{ cell }}</td>{% endfor %}
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% if not csv_rows %}
+          <p class="hint">文件只有表头，没有数据行。</p>
+          {% else %}
+          <p class="hint">最多预览前 200 行{% if csv_truncated %}（已截断）{% endif %}；下载文件包含全部数据。</p>
+          {% endif %}
+        {% else %}
+          <p class="hint">CSV 没有可显示的内容。</p>
+        {% endif %}
+      {% else %}
+        {{ empty_state('fa-table', '暂无曲线数据', '如果选择了“仅分析”，需要先确认坐标轴范围再运行提取；自动任务请查看报告和日志。') }}
+      {% endif %}
+
+    {% elif active_tab == 'templates' %}
+      {{ file_picker(view, 'templates', file_options, selected_rel, '选择模板结果', scope_paper.scope if scope_paper else '') }}
+      {% if selected_rel %}
+        <div class="preview-toolbar">
+          <span class="file-caption mb-0"><i class="fa-solid fa-file-export" aria-hidden="true"></i>
+            <span class="mono">{{ selected_rel }}</span></span>
+          <a class="btn btn-sm btn-primary"
+             href="{{ url_for('main.download_artifact', run_id=view.run_id, artifact_path=selected_rel, download=1) }}">
+            <i class="fa-solid fa-download" aria-hidden="true"></i> 下载模板结果
+          </a>
+        </div>
+        {% if preview_error %}
+        <div class="alert alert-warning" role="alert">{{ preview_error }}</div>
+        {% else %}
+        <pre class="text-preview">{{ preview_text }}</pre>
+        {% if preview_truncated %}<p class="hint">预览已截断，下载文件包含完整内容。</p>{% endif %}
+        {% endif %}
+      {% else %}
+        {{ empty_state('fa-file-export', '本次没有模板文件', '需要按指定格式导出时，在开始提取前上传模板；模板导出需要视觉模型与自动提取。') }}
+      {% endif %}
+
+    {% elif active_tab == 'report' %}
+      {{ file_picker(view, 'report', file_options, selected_rel, '选择报告', scope_paper.scope if scope_paper else '') }}
+      {% if selected_rel %}
+        <div class="preview-toolbar">
+          <span class="file-caption mb-0"><i class="fa-solid fa-file-lines" aria-hidden="true"></i>
+            <span class="mono">{{ selected_rel }}</span></span>
+          <a class="btn btn-sm btn-outline-secondary"
+             href="{{ url_for('main.download_artifact', run_id=view.run_id, artifact_path=selected_rel, download=1) }}">
+            <i class="fa-solid fa-download" aria-hidden="true"></i> 下载报告
+          </a>
+        </div>
+        {% if preview_error %}
+        <div class="alert alert-warning" role="alert">{{ preview_error }}</div>
+        {% else %}
+        <pre class="text-preview">{{ preview_text }}</pre>
+        {% if preview_truncated %}<p class="hint">预览已截断，下载文件包含完整内容。</p>{% endif %}
+        {% endif %}
+      {% else %}
+        {{ empty_state('fa-file-lines', '暂无报告', '任务完成后通常会生成 report.md；失败原因也可能记录在日志中。') }}
+      {% endif %}
+
+    {% else %}
+      <h3 class="section-title">实际执行参数</h3>
+      <p class="hint">以下参数不含 API Key；密钥只通过子进程环境变量传递。</p>
+      {% if command_json %}
+      <pre class="code-preview">{{ command_json }}</pre>
+      {% else %}
+      <p class="hint">旧任务没有保存命令行参数。</p>
+      {% endif %}
+
+      <h3 class="section-title">坐标配置</h3>
+      {% if configs %}
+      <ul class="config-list">
+        {% for item in configs %}
+        <li>
+          <span class="mono">{{ item.rel }}</span>
+          <a class="btn btn-sm btn-outline-secondary"
+             href="{{ url_for('main.download_artifact', run_id=view.run_id, artifact_path=item.rel, download=1) }}">
+            <i class="fa-solid fa-download" aria-hidden="true"></i> 下载
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="hint">本次没有可下载的坐标配置文件。</p>
+      {% endif %}
+
+      <h3 class="section-title">运行日志</h3>
+      {% if log_text %}
+      <pre class="log-view log-view-static">{{ log_text }}</pre>
+      <p class="hint">完整日志保存在任务目录的 <code>ui-run.log</code>。</p>
+      {% else %}
+      <p class="hint">暂无日志。任务排队时还没有输出。</p>
+      {% endif %}
+    {% endif %}
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+{% if chart_data and active_tab == 'images' %}
+<script src="{{ url_for('static', filename='js/verify-chart.js') }}"></script>
+{% endif %}
+{% endblock %}

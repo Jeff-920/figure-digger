@@ -49,10 +49,12 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(n).decode())
         auth = self.headers.get("Authorization", "")
         content = payload["messages"][-1]["content"]
-        text = content[0]["text"] if isinstance(content, list) else str(content)
-        has_image = isinstance(content, list) and any(
-            b.get("type") == "image_url" for b in content)
-        data_uri = content[1]["image_url"]["url"] if has_image else ""
+        blocks = content if isinstance(content, list) else []
+        text_block = next((b for b in blocks if b.get("type") == "text"), {})
+        image_block = next((b for b in blocks if b.get("type") == "image_url"), {})
+        text = text_block.get("text", "") if blocks else str(content)
+        has_image = bool(image_block)
+        data_uri = image_block.get("image_url", {}).get("url", "") if has_image else ""
         CAPTURED.append({"model": payload.get("model"), "auth": auth,
                          "json_mode": "response_format" in payload,
                          "thinking": payload.get("thinking"),

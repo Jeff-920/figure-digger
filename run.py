@@ -2,14 +2,15 @@
 
 Two phases, because axis ranges must be confirmed by a human before data is trusted:
 
-  python run.py analyze paper.pdf --out out/          # figures, panels, legend colours, OCR axis ranges
+  python run.py analyze paper.pdf --out out/ --vlm    # figures, panels, legend colours, axis ranges
   python run.py confirm out/paper_config.json --id fig5_p1 --x 0,5 --y 0,70
   python run.py extract out/paper_config.json         # only confirmed panels
-  python run.py all paper.pdf --out out/ --force      # one shot, trusting OCR as-is
+  python run.py all paper.pdf --out out/ --vlm --force # one shot, trusting model axis ranges as-is
 
-With a VLM the axis reading replaces OCR (which is then off by default, it is 5-10x slower):
+The visual model reads axis tick values.  Vector figures can still provide their
+own calibration from the PDF's text; raster figures without --vlm have no
+automatic axis reader and remain unconfirmed.
 
-  python run.py all paper.pdf --out out/ --vlm
   python run.py batch ./papers --out ./out --vlm --jobs 4    # one process per paper
 
 Outputs under --out:
@@ -18,15 +19,17 @@ Outputs under --out:
   csv/         extracted data, one CSV per series
   verify/      reprojection overlays for visual QA
   paper_config.json   phase-1 result; edit "axis" and set "confirmed": true
-  report.md           what was extracted, with the OCR evidence per axis
+  report.md           what was extracted, with the axis evidence
 
 The CLI is concise by default. Add --verbose for detailed progress and
---keep-intermediates to persist gap/review/OCR/selection diagnostics.
+--keep-intermediates to persist gap/review/selection diagnostics.
 """
 
 import argparse
+import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import sys
@@ -67,7 +70,7 @@ except ImportError as _exc:  # almost always "wrong Python environment"
     print(_bar)
     raise SystemExit(2)
 
-import axis_ranges as ar  # noqa: E402
+import axis_calibration as ac  # noqa: E402
 import batch_extract as be  # noqa: E402
 import extract_lines as el  # noqa: E402
 import figure_index as fi  # noqa: E402
@@ -85,6 +88,117 @@ _LOG_FILE = None
 _VERBOSE = False
 _KEEP_INTERMEDIATES = False
 _INTERMEDIATE_DIRS = ("gaps", "review", "debug", "select", "objects")
+# Bump when analysis prompts/phases change; otherwise a cached config may be
+# reused across incompatible pipeline versions.
+ANALYSIS_CACHE_VERSION = 1
+ANALYSIS_CACHE_DIR = ROOT / ".analysis_cache"
+
+
+def _file_digest(path: Path, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _analysis_cache_key(pdf_path: Path, dpi: int, pages, want, want_deep,
+                        find_series: bool, vlm) -> str:
+    material = {
+        "version": ANALYSIS_CACHE_VERSION,
+        "pdf_sha256": _file_digest(pdf_path),
+        "dpi": int(dpi),
+        "pages": str(pages or ""),
+        "want": str(want or ""),
+        "want_deep": bool(want_deep),
+        "find_series": bool(find_series),
+        "model": getattr(vlm, "model", "") if vlm is not None else "no-vlm",
+        "base_url": getattr(vlm, "base_url", "") if vlm is not None else "",
+    }
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _portable_config(config: dict, outdir: Path, pdf_path: Path) -> dict:
+    portable = json.loads(json.dumps(config, ensure_ascii=False))
+    old_out, old_pdf = str(outdir), str(pdf_path)
+
+    def walk(value):
+        if isinstance(value, str):
+            value = value.replace(old_out, "__OUTDIR__")
+            return value.replace(old_pdf, "__PDF__")
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        if isinstance(value, dict):
+            return {key: walk(item) for key, item in value.items()}
+        return value
+    return walk(portable)
+
+
+def _restore_config(config: dict, outdir: Path, pdf_path: Path) -> dict:
+    restored = json.loads(json.dumps(config, ensure_ascii=False))
+
+    def walk(value):
+        if isinstance(value, str):
+            value = value.replace("__OUTDIR__", str(outdir))
+            return value.replace("__PDF__", str(pdf_path))
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        if isinstance(value, dict):
+            return {key: walk(item) for key, item in value.items()}
+        return value
+    restored = walk(restored)
+    restored["outdir"] = str(outdir)
+    restored["pdf"] = str(pdf_path)
+    return restored
+
+
+def _load_analysis_cache(cache_dir: Path, outdir: Path, pdf_path: Path,
+                         cfg_path: Path) -> bool:
+    cache_config = cache_dir / "config.json"
+    if not cache_config.is_file() or not (cache_dir / "panels").is_dir():
+        return False
+    try:
+        config = json.loads(cache_config.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            return False
+    except (OSError, ValueError):
+        return False
+    outdir.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(cache_dir / "panels", outdir / "panels", dirs_exist_ok=True)
+    figures = cache_dir / "figures"
+    if figures.is_dir():
+        shutil.copytree(figures, outdir / "figures", dirs_exist_ok=True)
+    cfg_path.write_text(
+        json.dumps(_restore_config(config, outdir, pdf_path), indent=2, ensure_ascii=False),
+        encoding="utf-8")
+    return True
+
+
+def _save_analysis_cache(cache_dir: Path, outdir: Path, pdf_path: Path,
+                         config: dict) -> None:
+    staging = cache_dir.with_name(cache_dir.name + f".tmp-{os.getpid()}")
+    if staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    try:
+        for name in ("panels", "figures"):
+            source = outdir / name
+            if source.is_dir():
+                shutil.copytree(source, staging / name)
+        (staging / "config.json").write_text(
+            json.dumps(_portable_config(config, outdir, pdf_path),
+                       indent=2, ensure_ascii=False), encoding="utf-8")
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        staging.rename(cache_dir)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def log(msg, detail=False):
@@ -1757,7 +1871,7 @@ def doctor():
     print()
     checks = [("numpy", "数组运算", True), ("cv2", "图像处理", True),
               ("pdfplumber", "PDF 解析", True), ("PIL", "图片编码", True),
-              ("rapidocr_onnxruntime", "刻度 OCR（可选）", False)]
+              ("pypdfium2", "PDF 渲染", True), ("pdfminer", "PDF 文本", True)]
     bad = 0
     for mod, why, required in checks:
         ok = importlib.util.find_spec(mod) is not None
@@ -1774,27 +1888,17 @@ def doctor():
         print(f"  {mod:<22} {tag} {why}{detail}")
     key = vlmc.load_api_key()
     print(f"  {'VLM key':<22} {'✅' if key else '⚠️ '} "
-          + ("已配置（内容不会被打印）" if key else "未配置：VLM 功能不可用，其余流程正常"))
-    # RapidOCR pulls these in transitively; a --no-deps install misses them and only
-    # fails much later, deep inside the OCR engine.
-    # 这些是容易被 --no-deps 安装漏掉的传递依赖；缺了往往要到很晚才报错，
-    # 甚至只是"某个功能静默失效"（例如缺 pypdfium2 时所有图都导不出来）。
-    ocr_deps = ["yaml", "shapely", "pyclipper", "onnxruntime", "six", "tqdm",
-                "pypdfium2", "pdfminer"]
-    missing = [m for m in ocr_deps if importlib.util.find_spec(m) is None]
-    if missing:
-        print(f"  {'OCR 传递依赖':<22} ⚠️  缺 {', '.join(missing)}"
-              "  → pip install -r requirements.txt")
+          + ("已配置（内容不会被打印）" if key else "未配置：位图轴读数不可用，矢量流程仍可运行"))
     print()
     if bad:
         print(f"❌ 有 {bad} 个必需依赖不可用。多半是环境不对——请激活装了依赖的环境"
               "（例如 conda activate pytorch）后重试。")
     else:
-        print("✅ 必需依赖齐备，可以运行：python run.py all <pdf> --out out_dir [--vlm]")
+        print("✅ 必需依赖齐备，可以运行：python run.py all <pdf> --out out_dir --vlm")
 
 
 def _norm_axis(value):
-    """Accept {'min','max'} (VLM) or [lo, hi] (OCR/manual) -> [lo, hi] or None."""
+    """Accept {'min','max'} (VLM) or [lo, hi] (manual) -> [lo, hi] or None."""
     if isinstance(value, dict):
         if str(value.get('scale') or 'linear').lower() != 'linear':
             return None  # This pipeline has a linear pixel-to-value transform.
@@ -1929,23 +2033,13 @@ def _norm_y_axes(vlm_result):
     return out
 
 
-def merge_axis(vlm_axis, ocr_axis, tol_frac=0.02):
-    """Decide the final axis range. The VLM is the primary reader; OCR is an
-    independent cross-check and the fallback when the model is unavailable.
+def resolve_vlm_axis(vlm_axis):
+    """Return the model-read axis range as (values, confirmed, source, note)."""
 
-    Returns (values, confirmed, source, note).
-    """
-    v, o = _norm_axis(vlm_axis), _norm_axis(ocr_axis)
-    if v and o:
-        span = max(abs(v[1] - v[0]), 1e-9)
-        if max(abs(v[0] - o[0]), abs(v[1] - o[1])) <= tol_frac * span:
-            return v, True, "vlm+ocr一致", ""
-        return v, True, "vlm", f"OCR 读数不同（VLM {v} vs OCR {o}），采用 VLM，建议抽检"
-    if v:
-        return v, True, "vlm", "OCR 未读出，仅 VLM 读数"
-    if o:
-        return o, False, "ocr", "VLM 未读出，回退 OCR（建议人工确认）"
-    return None, False, "none", "两轴均未读出"
+    values = _norm_axis(vlm_axis)
+    if values:
+        return values, True, "vlm", ""
+    return None, False, "none", "未读出轴范围（位图任务需要视觉模型）"
 
 
 def print_vlm_usage(client, phase, before=None):
@@ -1989,24 +2083,33 @@ def print_vlm_usage(client, phase, before=None):
     log(bar)
 
 
-def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=None,
+def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, want=None,
             want_deep=False, find_series=True, report_usage=True):
-    """use_ocr=None means "auto": with a VLM the model is the primary axis reader and
-    OCR (5-10x slower, same job) stays off; without one OCR is the only reader left."""
-    if use_ocr is None:
-        use_ocr = vlm is None
+    """Read figures, panel crops and axis ranges; the visual model reads raster axes.
+
+    Vector figures carry their own calibration from the PDF text.  Without a VLM,
+    raster panels remain unconfirmed instead of being guessed.
+    """
     t0 = time.time()
     pdf_path = Path(pdf_path).resolve()
     outdir = Path(outdir).resolve()
     _clean_stale_intermediates(outdir)
     (outdir / "figures").mkdir(parents=True, exist_ok=True)
     (outdir / "panels").mkdir(parents=True, exist_ok=True)
-    if use_ocr:
-        if _KEEP_INTERMEDIATES:
-            (outdir / "debug").mkdir(parents=True, exist_ok=True)
-    elif vlm is not None:
-        log("OCR 交叉核对已关闭（VLM 模式下默认关闭；要两路对照请加 --ocr）",
-            detail=True)
+    cfg_path = outdir / f"{pdf_path.stem}_config.json"
+    analysis_cache_enabled = getattr(vlm, "use_cache", True) if vlm is not None else True
+    cache_dir = None
+    if analysis_cache_enabled:
+        try:
+            cache_key = _analysis_cache_key(
+                pdf_path, dpi, pages, want, want_deep, find_series, vlm)
+            cache_dir = ANALYSIS_CACHE_DIR / cache_key
+            if _load_analysis_cache(cache_dir, outdir, pdf_path, cfg_path):
+                log(f"分析缓存命中：{pdf_path.name}（跳过选图/面板/轴识别）")
+                return cfg_path
+        except Exception as exc:  # noqa: BLE001 - cache must never block analysis
+            log(f"（分析缓存读取失败，继续正常分析：{type(exc).__name__}: {exc}）")
+            cache_dir = None
 
     with tp.pdfplumber.open(pdf_path) as pdf:
         want_pages = None
@@ -2020,7 +2123,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
         }
         report["exported"] = tp.export_figures(pdf, report, outdir, dpi)
 
-        # Vector figures contain their own data: no rasterising, no OCR needed.
+        # Vector figures contain their own data: no rasterising needed.
         vector_found = []
         vector_fallback = []   # 矢量区域读不出刻度 -> 渲染成位图，交给后面的位图路线
         exported_by_page = {}
@@ -2094,7 +2197,6 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
             captions_by_page[p["page"]] = caps
 
     config = {"pdf": str(pdf_path), "outdir": str(outdir), "panels": []}
-    engine = ar.get_engine() if use_ocr else None   # 不跑 OCR 就别去加载识别引擎（要好几秒）
     vlm_usage0 = dict(vlm.usage) if vlm is not None else None
 
     # ---- 候选图清单：先把"每张图 + 它自己的图注"配好，再按需求筛 ----
@@ -2178,7 +2280,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
             "axis": {
                 "x": vx.axis_range_from_calibration(xcal, res["axes"], "x"),
                 "y": vx.axis_range_from_calibration(ycal, res["axes"], "y"),
-                # values come from the PDF's own text, not OCR -> trust them
+                # values come from the PDF's own text -> trust them
                 "confirmed": True,
                 "source": "vector-text",
             },
@@ -2217,7 +2319,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                 log(f"      VLM 矢量曲线定位异常: {type(exc).__name__}: {exc}")
         log(f"\n[矢量图] p{pno} bbox={reg['bbox']}  "
             f"x={entry['axis']['x']} y={entry['axis']['y']}  "
-            f"{len(res.get('series', []))} 条路径序列（直接读取，无需 OCR）", detail=True)
+            f"{len(res.get('series', []))} 条路径序列（直接从 PDF 读取）", detail=True)
         config["panels"].append(entry)
 
     for fig in exported:                     # 矢量回退图排在最前，其余是导出的位图图
@@ -2231,7 +2333,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
         log(f"\n[图] {fig_path.name}  (p{page})" + (f"  ← {note}" if note else ""),
             detail=True)
 
-        # ---- 第一步就交给 VLM 判断：不是数据图就整图跳过，省掉切分与 OCR 的开销 ----
+        # ---- 第一步就交给 VLM 判断：不是数据图就整图跳过，省掉切分与读轴的开销 ----
         vlm_cls, name_map = None, {}
         if vlm is not None:
                 try:
@@ -2241,7 +2343,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                         f"可提取={vlm_cls.get('is_line_chart')}"
                         f"  （{str(vlm_cls.get('reason', ''))[:40]}）", detail=True)
                     if vlm_cls.get("is_line_chart") is False:
-                        log("      ⏭ 跳过：VLM 判定为非数据图（照片/示意图/表格），不再切分与 OCR",
+                        log("      ⏭ 跳过：VLM 判定为非数据图（照片/示意图/表格），不再切分与读轴",
                             detail=True)
                         continue
                     multi_y = bool(vlm_cls.get("dual_y_axis"))
@@ -2375,7 +2477,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
             labels = split_info.get("panel_labels") or []
             if idx <= len(labels) and labels[idx - 1]:
                 entry["panel_label"] = labels[idx - 1]
-            # ---- 轴读数：VLM 先读（主），OCR 随后独立核对（辅）----
+            # ---- 轴读数：视觉模型读取刻度与范围，再把刻度值校准到实际刻线 ----
             planned_axis = panel_plan.get("axis") if isinstance(panel_plan, dict) else None
             if not planned_axis and isinstance(vlm_cls, dict):
                 planned_axis = vlm_cls.get("shared_axis")
@@ -2386,7 +2488,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                 try:
                     va = vt.read_axis_ranges(vlm, panel_path, hint=_axis_hint(want),
                         figure_path=fig_path, panel_label=entry.get("panel_label"),frame=frame)
-                    va = ar.calibrate_vlm_ticks(panel_img,frame,va)
+                    va = ac.calibrate_vlm_ticks(panel_img, frame, va)
                     entry["axis_read_source"] = "full-resolution-panel"
                     for key,source in [('x',va.get('x'))]+[
                             (a.get('side','left')+' y',a) for a in va.get('y_axes') or []]:
@@ -2401,7 +2503,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                             entry.setdefault('notes',[]).append(note)
                 except vlmc.VLMError as exc:
                     va = None
-                    log(f"      VLM 子图轴读数失败: {exc}（回退 OCR，不使用未经子图核对的整图轴值）")
+                    log(f"      VLM 子图轴读数失败: {exc}（不使用未经子图核对的整图轴值）")
                 except Exception as exc:  # noqa: BLE001
                     va = None
                     log(f"      VLM 轴读数异常: {type(exc).__name__}: {exc}")
@@ -2425,22 +2527,6 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                         for k, d in y_axes.items()) or "None")
                     + f"  置信度={va.get('confidence')}", detail=True)
 
-            ocr_ranges = {}
-            if use_ocr:
-                try:
-                    ocr_ranges = ar.read_axis_ranges(
-                        panel_path, frame, engine=engine, log=detail_log,
-                        debug_crops=(outdir / "debug") if _KEEP_INTERMEDIATES else None)
-                    entry["ocr"] = {k: v for k, v in ocr_ranges.items()
-                                    if k in ("x", "y", "bands")}
-                    ox = ocr_ranges.get("x", {}).get("range") if "x" in ocr_ranges else None
-                    oy = ocr_ranges.get("y", {}).get("range") if "y" in ocr_ranges else None
-                    log(f"      OCR 对照: x={ox} y={oy}", detail=True)
-                except Exception as exc:  # noqa: BLE001
-                    log(f"      OCR 失败: {type(exc).__name__}: {exc}（不影响 VLM 读数）")
-            else:
-                log("      OCR 已跳过（VLM 模式下默认关闭）", detail=True)
-
             # x 轴全面板共用；y 轴以"左轴"作为面板默认值，逐条曲线再按 VLM 的归属覆盖
             for axis_key in ("x", "y"):
                 if axis_key == "x":
@@ -2455,9 +2541,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                     first = y_axes.get("left") or (list(y_axes.values())[0] if y_axes else None)
                     v_val = first["range"] if first else None
                     v_mult = (first or {}).get("multiplier", 1.0)
-                o_val = (ocr_ranges.get(axis_key, {}) or {}).get("range") \
-                    if axis_key in ocr_ranges else None
-                vals, conf, src, note = merge_axis(v_val, o_val)
+                vals, conf, src, note = resolve_vlm_axis(v_val)
                 if vals:
                     entry["axis"][axis_key] = vals
                 if abs(_as_float(v_mult, 1.0) - 1.0) > 1e-12:
@@ -2541,17 +2625,12 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
             entry["curve_content"] = {"coverage": round(coverage, 3),
                                       "median_thickness": round(thickness, 2)}
             curve_ok = coverage >= 0.75 and thickness >= 2
-            ocr = entry.get("ocr", {})
-            ocr_ok = all(
-                ocr.get(a) and ocr[a]["n_labels"] >= 4 and ocr[a]["r2"] >= 0.9995
-                for a in ("x", "y"))
-            # 第二重证据 = 两轴范围确实被读出来了。VLM 读的算数（它是主读数来源，
-            # "是不是数据图"已由最前面的分类把关），OCR 读的按拟合质量算数。
-            # 注意：开 OCR 做交叉核对不该让判定变得更严——那样 VLM 读对的图反被丢掉。
+            # 第二重证据 = 两轴范围确实由模型读出来了。模型读数已经过子图轴核对；
+            # "是不是数据图"由最前面的分类把关。
             vlm_ok = vlm is not None and all(
-                s in ("vlm", "vlm+ocr一致")
+                s == "vlm"
                 for s in (entry.get("axis_src_x"), entry.get("axis_src_y")))
-            if not (curve_ok or vlm_ok or ocr_ok):
+            if not (curve_ok or vlm_ok):
                 entry["skip"] = True
                 entry["skip_reason"] = (
                     f"非折线图（曲线覆盖率 {coverage:.2f}/厚度 {thickness:.1f} 未达标，"
@@ -2564,8 +2643,13 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                     f"系列可能不连续或不是折线图，建议人工确认")
             config["panels"].append(entry)
 
-    cfg_path = outdir / f"{pdf_path.stem}_config.json"
     cfg_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    if cache_dir is not None:
+        try:
+            _save_analysis_cache(cache_dir, outdir, pdf_path, config)
+            log(f"分析结果已缓存：{cache_dir.name[:12]}（下次同 PDF/同需求可直接复用）")
+        except Exception as exc:  # noqa: BLE001 - cache must never block analysis
+            log(f"（分析缓存写入失败，不影响本次结果：{type(exc).__name__}: {exc}）")
     write_report(config, outdir / "report.md", phase="analyze")
     log(f"\n共 {len(config['panels'])} 个面板，耗时 {_elapsed(t0)} -> {cfg_path}")
     if want and not keep:
@@ -2626,7 +2710,7 @@ def write_report(config, path, phase, results=None):
         lines += [
             f"## {p['id']}  (p{p['page']}, {conf})",
             "",
-            f"- 提取方式: {'矢量（直接从 PDF 路径读取，无 OCR）' if p.get('method') == 'vector' else '位图（图例取色 + 图像处理）'}",
+            f"- 提取方式: {'矢量（直接从 PDF 路径读取）' if p.get('method') == 'vector' else '位图（图例取色 + 图像处理）'}",
             f"- 图注: {p['caption'][:120] or '(未匹配到图注)'}",
             (f"- 矢量区域: {p['vector_bbox']}（第 {p['page']} 页）" if p.get("method") == "vector"
              else f"- 面板图: `{p.get('panel_image', '')}`"),
@@ -2656,15 +2740,6 @@ def write_report(config, path, phase, results=None):
                             if verdict else ""))
         if p.get("skip") and p.get("skip_reason"):
             lines.append(f"- ⏭ 跳过原因: {p['skip_reason']}")
-        ocr = p.get("ocr", {})
-        for axis in ("x", "y"):
-            if axis in ocr:
-                o = ocr[axis]
-                lines.append(
-                    f"  - {axis} 轴 OCR: 读到 {o['labels']} ({o['n_labels']} 个), "
-                    f"R²={o['r2']}, 步长={o['step']}, 吸附={'是' if o['snapped'] else '否'}"
-                    + (f", 离群={o['outliers']}" if o["outliers"] else "")
-                    + (f", 已修复={o['repaired']}" if o["repaired"] else ""))
         spec = p.get("series_spec")
         if spec:
             lines.append("- 模型指出的曲线（锚点只是种子，数值由代码从锚点追踪得出）:")
@@ -3138,8 +3213,7 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None, report_us
                                         figure_path=figure_path if figure_path.is_file() else None)
                     # tolerance from the chart's own tick spacing, not a % of the range
                     step = None
-                    axis_sources = [p.get("ocr", {}).get("y"),
-                                    (p.get("vlm_axis") or {}).get("y")]
+                    axis_sources = [(p.get("vlm_axis") or {}).get("y")]
                     axis_sources.extend((p.get("y_axes") or {}).values())
                     for src in axis_sources:
                         if isinstance(src, dict) and src.get("step"):
@@ -3192,10 +3266,10 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None, report_us
     return results
 
 
-def _run_one(pdf, sub, row, dpi, pages, force, vlm, use_ocr, want=None, want_deep=False,
+def _run_one(pdf, sub, row, dpi, pages, force, vlm, want=None, want_deep=False,
              find_series=True, template=None):
     """One PDF end-to-end (analyze + extract). Shared by serial and parallel batch."""
-    cfg = analyze(pdf, sub, dpi=dpi, vlm=vlm, pages=pages, use_ocr=use_ocr, want=want,
+    cfg = analyze(pdf, sub, dpi=dpi, vlm=vlm, pages=pages, want=want,
                   want_deep=want_deep, find_series=find_series, report_usage=False)
     config = json.loads(Path(cfg).read_text(encoding="utf-8"))
     if config.get("selection"):
@@ -3228,7 +3302,7 @@ def _log_row(row, with_vlm):
         + (f" | ✗ {row['error']}" if row.get("error") else ""))
 
 
-def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None,
+def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, want=None,
                want_deep=False, find_series=True, template=None,
                verbose=False, keep_intermediates=False):
     """Worker body for --jobs > 1: one PDF per process.
@@ -3253,7 +3327,7 @@ def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None
                 client = None
         _LOG_FILE = ((sub / "run.log").open("w", encoding="utf-8")
                      if _VERBOSE else io.StringIO())
-        _run_one(pdf, sub, row, dpi, pages, force, client, use_ocr, want, want_deep,
+        _run_one(pdf, sub, row, dpi, pages, force, client, want, want_deep,
                  find_series, template)
     except Exception as exc:  # noqa: BLE001
         row["error"] = f"{type(exc).__name__}: {exc}"
@@ -3270,7 +3344,7 @@ def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None
     return row
 
 
-def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want=None,
+def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, want=None,
                   want_deep=False, find_series=True, template=None):
     rows = []
     for i, pdf in enumerate(pdfs, start=1):
@@ -3280,7 +3354,7 @@ def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want=None,
         before = dict(vlm.usage) if vlm is not None else None
         row = new_row(pdf, sub)
         try:
-            _run_one(pdf, sub, row, dpi, pages, force, vlm, use_ocr, want, want_deep,
+            _run_one(pdf, sub, row, dpi, pages, force, vlm, want, want_deep,
                      find_series, template)
         except Exception as exc:  # noqa: BLE001
             row["error"] = f"{type(exc).__name__}: {exc}"
@@ -3296,7 +3370,7 @@ def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want=None,
     return rows
 
 
-def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want=None,
+def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, want=None,
                     want_deep=False, find_series=True, template=None):
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -3304,7 +3378,7 @@ def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want=No
     rows, done = [], 0
     with ProcessPoolExecutor(max_workers=jobs) as ex:
         futures = {ex.submit(_batch_one, str(pdf), str(outdir / pdf.stem), dpi, pages,
-                             force, spec, use_ocr, want, want_deep,
+                             force, spec, want, want_deep,
                              find_series, template, _VERBOSE,
                              _KEEP_INTERMEDIATES): pdf for pdf in pdfs}
         for fut in as_completed(futures):
@@ -3323,11 +3397,11 @@ def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want=No
 
 
 def batch(dir_path, outdir, dpi=300, vlm=None, pages=None, force=False,
-          pattern="*.pdf", recursive=False, use_ocr=True, jobs=1, want=None,
+          pattern="*.pdf", recursive=False, jobs=1, want=None,
           want_deep=False, find_series=True, template=None):
     """Process every PDF in a folder, then write a combined summary.
 
-    jobs=1 keeps everything in one process (shared OCR engine / VLM client and caches).
+    jobs=1 keeps everything in one process (shared VLM client and caches).
     jobs>1 runs one paper per process: the VLM calls are network-bound, so this is where
     the wall-clock speedup comes from. Each paper logs to <out>/<pdf>/run.log.
     """
@@ -3343,19 +3417,18 @@ def batch(dir_path, outdir, dpi=300, vlm=None, pages=None, force=False,
     jobs = max(1, int(jobs or 1))
     log(f"批量处理 {len(pdfs)} 个 PDF -> {outdir}"
         + (f"   并行 {jobs} 进程，每篇日志见 <out>/<pdf>/run.log" if jobs > 1 else "")
-        + ("   [OCR 已关闭]" if not use_ocr else "")
         + (f"\n需求：{want}" if want else "")
         + "\n" + "=" * 66)
 
     if jobs > 1:
-        rows = _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want,
+        rows = _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, want,
                                want_deep, find_series, template)
         # 用量在子进程里累计，父进程按行加总后再打印
         if vlm is not None:
             for k in vlm.usage:
                 vlm.usage[k] = sum(r.get("usage", {}).get(k, 0) for r in rows)
     else:
-        rows = _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want,
+        rows = _batch_serial(pdfs, outdir, dpi, pages, force, vlm, want,
                              want_deep, find_series, template)
 
     md = ["# 批量提取汇总", "",
@@ -3391,7 +3464,7 @@ def batch(dir_path, outdir, dpi=300, vlm=None, pages=None, force=False,
     log(f"汇总 -> {outdir / 'batch_summary.md'}")
     if tot_c == 0 and vlm is None and not force:
         log("提示：一条曲线都没提取。轴范围未经确认时 extract 会跳过所有面板——"
-            "请加 --vlm（两路读数一致则自动确认）或 --force（直接信任 OCR 读数）。")
+            "位图任务请加 --vlm 读取轴范围；矢量图自带坐标；也可用 --force 信任已有轴范围。")
     elif tot_c == 0 and want:
         hit = [r["pdf"] for r in rows if r.get("matched")]
         log(f"提示：没有提取到曲线。需求「{want}」在"
@@ -3437,9 +3510,9 @@ def main():
         parser.add_argument("--verbose", action="store_true",
                             help="打印逐图、逐曲线与 VLM 用量明细")
         parser.add_argument("--keep-intermediates", action="store_true",
-                            help="保留 gaps/review/debug/select 等诊断中间文件")
+                            help="保留 gaps/review/select 等诊断中间文件")
 
-    a = sub.add_parser("analyze", help="PDF -> 图片/面板/图例色/OCR 轴范围 + 配置")
+    a = sub.add_parser("analyze", help="PDF -> 图片/面板/图例色/轴范围 + 配置")
     a.add_argument("pdf")
     a.add_argument("--out", required=True)
     a.add_argument("--dpi", type=int, default=300)
@@ -3448,10 +3521,6 @@ def main():
                    help="启用 DeepSeek VLM（分类/轴读数/命名），需配置 key")
     a.add_argument("--vlm-model", default=vlmc.DEFAULT_MODEL)
     a.add_argument("--vlm-base-url", default=vlmc.DEFAULT_BASE_URL)
-    a.add_argument("--no-ocr", action="store_true",
-                   help="不跑刻度 OCR（--vlm 时默认如此，比 OCR 快 5-10 倍）")
-    a.add_argument("--ocr", action="store_true",
-                   help="即使启用 VLM 也跑 OCR，用于两路交叉核对")
     a.add_argument("--want", default=None,
                    help="用一句话说要哪些图，如 --want \"800 bar 下速度随时间的折线图\"")
     a.add_argument("--want-deep", action="store_true",
@@ -3479,7 +3548,7 @@ def main():
     c.add_argument("--y", default=None)
     c.add_argument("--skip", action="store_true", help="标记该面板为跳过")
 
-    al = sub.add_parser("all", help="analyze + extract（--force 时直接信任 OCR 数值）")
+    al = sub.add_parser("all", help="analyze + extract（--force 时不再要求人工确认轴范围）")
     al.add_argument("pdf")
     al.add_argument("--out", required=True)
     al.add_argument("--dpi", type=int, default=300)
@@ -3488,8 +3557,6 @@ def main():
     al.add_argument("--vlm", action="store_true")
     al.add_argument("--vlm-model", default=vlmc.DEFAULT_MODEL)
     al.add_argument("--vlm-base-url", default=vlmc.DEFAULT_BASE_URL)
-    al.add_argument("--no-ocr", action="store_true", help="不跑刻度 OCR")
-    al.add_argument("--ocr", action="store_true", help="即使启用 VLM 也跑 OCR 交叉核对")
     al.add_argument("--want", default=None, help="用一句话说要哪些图（见 README）")
     al.add_argument("--want-deep", action="store_true", help="再用正文段落判定一次")
     al.add_argument("--no-find-series", action="store_true", help="不让模型找曲线")
@@ -3509,8 +3576,6 @@ def main():
     b.add_argument("--vlm", action="store_true")
     b.add_argument("--vlm-model", default=vlmc.DEFAULT_MODEL)
     b.add_argument("--vlm-base-url", default=vlmc.DEFAULT_BASE_URL)
-    b.add_argument("--no-ocr", action="store_true", help="不跑刻度 OCR")
-    b.add_argument("--ocr", action="store_true", help="即使启用 VLM 也跑 OCR 交叉核对")
     b.add_argument("--jobs", type=int, default=1,
                    help="并行进程数，每篇一个进程（默认 1=串行）")
     b.add_argument("--want", default=None,
@@ -3536,29 +3601,18 @@ def main():
         if not client.api_key:
             log("⚠ 指定了 --vlm 但没找到 API key："
                 "请把 key 写入项目根目录的 deepseek_key.txt 或设置 DEEPSEEK_API_KEY。"
-                "本次将只走 OCR / 图像处理路线。")
+                "本次只做矢量/图像处理；位图坐标轴无法自动读取。")
             return None
         log(f"VLM 已启用：model={client.model}  base_url={client.base_url}")
         return client
 
-    def use_ocr():
-        """OCR 是 VLM 的交叉核对；开了 VLM 就默认不跑（慢 5-10 倍，收益很小）。"""
-        if getattr(args, "ocr", False):
-            return True
-        if getattr(args, "no_ocr", False):
-            return False
-        return not getattr(args, "vlm", False)
-
-    if getattr(args, "no_ocr", False) and not getattr(args, "vlm", False):
-        log("⚠ 指定了 --no-ocr 但没启用 --vlm：轴范围将没有任何自动读数来源，"
-            "面板会因缺少轴范围被跳过（只能靠 run.py confirm 手填）。")
     if getattr(args, "want", None) and not getattr(args, "vlm", False):
         log("⚠ 指定了 --want 但没启用 --vlm：只能按图号匹配（--want \"Figure 5\"）；"
             "按图的内容找图需要模型（--vlm）。")
 
     if args.cmd == "analyze":
         analyze(args.pdf, args.out, args.dpi, vlm=make_vlm(), pages=args.pages,
-                use_ocr=use_ocr(), want=args.want, want_deep=args.want_deep,
+                want=args.want, want_deep=args.want_deep,
                 find_series=not args.no_find_series)
     elif args.cmd == "extract":
         extract(args.config, force=args.force,
@@ -3569,7 +3623,7 @@ def main():
     elif args.cmd == "all":
         client = make_vlm()
         cfg = analyze(args.pdf, args.out, args.dpi, vlm=client, pages=args.pages,
-                      use_ocr=use_ocr(), want=args.want, want_deep=args.want_deep,
+                      want=args.want, want_deep=args.want_deep,
                       find_series=not args.no_find_series, report_usage=False)
         extract(cfg, force=args.force, vlm=client,
                 template=False if args.no_template else args.template,
@@ -3579,7 +3633,7 @@ def main():
     elif args.cmd == "batch":
         batch(args.dir, args.out, dpi=args.dpi, vlm=make_vlm(), pages=args.pages,
               force=args.force, pattern=args.pattern, recursive=args.recursive,
-              use_ocr=use_ocr(), jobs=args.jobs, want=args.want,
+              jobs=args.jobs, want=args.want,
               want_deep=args.want_deep, find_series=not args.no_find_series,
               template=False if args.no_template else args.template)
     elif args.cmd == "doctor":

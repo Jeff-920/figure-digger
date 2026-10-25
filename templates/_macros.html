@@ -1,0 +1,98 @@
+{% macro status_badge(state, extra_class="", compact=False) -%}
+{% set text = state.short_label if compact and state.short_label else state.label %}
+<span class="status-badge status-{{ state.tone }}{% if extra_class %} {{ extra_class }}{% endif %}" title="{{ state.label }}{% if state.detail %}：{{ state.detail }}{% endif %}">
+  <i class="fa-solid {{ state.icon }}{% if state.key == 'running' %} fa-spin{% endif %}" aria-hidden="true"></i>
+  <span data-status-label>{{ text }}</span>
+</span>
+{%- endmacro %}
+
+{% macro empty_state(icon, title, text, action_url=None, action_label=None) -%}
+<div class="empty-state">
+  <div class="empty-icon"><i class="fa-solid {{ icon }}" aria-hidden="true"></i></div>
+  <h3>{{ title }}</h3>
+  <p>{{ text }}</p>
+  {% if action_url and action_label %}
+  <a class="btn btn-primary btn-sm" href="{{ action_url }}">
+    <i class="fa-solid fa-arrow-right" aria-hidden="true"></i> {{ action_label }}
+  </a>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+{% macro paper_table(papers, run_id) -%}
+<div class="table-responsive">
+  <table class="table paper-table align-middle">
+    <thead>
+      <tr>
+        <th scope="col" class="paper-index">#</th>
+        <th scope="col">文献</th>
+        <th scope="col">页数</th>
+        <th scope="col">状态</th>
+        <th scope="col">结果</th>
+        <th scope="col">曲线</th>
+        <th scope="col">说明</th>
+        <th scope="col" class="text-end">核对</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for paper in papers %}
+      {% if paper.counts.images %}
+        {% set target_tab = 'images' %}
+      {% elif paper.counts.csv %}
+        {% set target_tab = 'csv' %}
+      {% elif paper.counts.reports %}
+        {% set target_tab = 'report' %}
+      {% else %}
+        {% set target_tab = 'papers' %}
+      {% endif %}
+      <tr>
+        <td class="paper-index num">{{ loop.index }}</td>
+        <td>
+          <div class="paper-id mono" title="{{ paper.name }}">{{ paper.paper_id }}</div>
+          {% if paper.name != paper.paper_id %}
+          <div class="paper-file" title="{{ paper.name }}">{{ paper.name }}</div>
+          {% endif %}
+        </td>
+        <td class="num">{% if paper.pages %}{{ paper.pages }} 页{% else %}—{% endif %}</td>
+        <td>{{ status_badge(paper.state, compact=True) }}</td>
+        <td><span class="result-text">{{ paper.result_summary }}</span></td>
+        <td class="num">{% if paper.curves is not none %}{{ paper.curves }}{% else %}—{% endif %}</td>
+        <td>
+          {% if paper.error %}
+          <span class="paper-error" title="{{ paper.error }}">{{ paper.error }}</span>
+          {% else %}
+          <span class="text-muted">—</span>
+          {% endif %}
+        </td>
+        <td class="text-end">
+          <a class="icon-btn"
+             href="{{ url_for('main.run_detail', run_id=run_id, tab=target_tab, paper=paper.scope) if paper.scope else url_for('main.run_detail', run_id=run_id, tab=target_tab) }}"
+             title="核对这篇文献的图、数据与报告"
+             aria-label="核对 {{ paper.name }}">
+            <i class="fa-solid fa-eye" aria-hidden="true"></i>
+          </a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{%- endmacro %}
+
+{% macro file_picker(view, tab, file_options, selected_rel, label, paper_scope="") -%}
+{% if file_options|length > 1 %}
+<form class="file-picker" method="get" action="{{ url_for('main.run_detail', run_id=view.run_id) }}">
+  <input type="hidden" name="tab" value="{{ tab }}">
+  {% if paper_scope %}<input type="hidden" name="paper" value="{{ paper_scope }}">{% endif %}
+  <label class="visually-hidden" for="{{ tab }}-file">{{ label }}</label>
+  <select class="form-select form-select-sm" id="{{ tab }}-file" name="file" data-auto-submit>
+    {% for rel, name in file_options %}
+    <option value="{{ rel }}"{% if rel == selected_rel %} selected{% endif %}>{{ rel }}</option>
+    {% endfor %}
+  </select>
+  <button class="btn btn-sm btn-outline-secondary" type="submit">
+    <i class="fa-solid fa-eye" aria-hidden="true"></i> 查看
+  </button>
+</form>
+{% endif %}
+{%- endmacro %}

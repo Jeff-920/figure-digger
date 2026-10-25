@@ -1,7 +1,7 @@
 """Four VLM jobs for the extraction pipeline.
 
   1. classify_chart     - is this a line chart? how many panels? dual Y axis?
-  2. read_axis_ranges   - tick ranges for x and y (replaces / cross-checks OCR)
+  2. read_axis_ranges   - tick ranges for x and y
   3. name_series        - map detected colours to legend labels
   4. spot_check         - re-read a few y values independently, to audit our tracing
 

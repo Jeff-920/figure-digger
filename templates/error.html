@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}{{ code }} · {{ title }} · DIG Studio{% endblock %}
+{% block content %}
+<section class="surface error-card">
+  <div class="error-code">{{ code }}</div>
+  <h1>{{ title }}</h1>
+  <p>{{ message }}</p>
+  <div class="error-actions">
+    <a class="btn btn-primary" href="{{ url_for('main.index') }}">
+      <i class="fa-solid fa-table-list" aria-hidden="true"></i> 返回任务结果
+    </a>
+    <a class="btn btn-outline-secondary" href="{{ url_for('main.new_run') }}">
+      <i class="fa-solid fa-plus" aria-hidden="true"></i> 新建提取
+    </a>
+  </div>
+</section>
+{% endblock %}

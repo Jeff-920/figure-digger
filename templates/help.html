@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}使用说明 · DIG Studio{% endblock %}
+{% block content %}
+<div class="page-toolbar">
+  <div class="page-heading">
+    <div class="page-title-row">
+      <span class="page-icon"><i class="fa-solid fa-circle-question" aria-hidden="true"></i></span>
+      <h1 class="page-title">使用说明</h1>
+    </div>
+    <p class="page-subtitle">DIG 在本机运行：上传 PDF，后台提取，检查核对图后再使用数据。</p>
+  </div>
+  <div class="toolbar-actions">
+    <a class="btn btn-primary" href="{{ url_for('main.new_run') }}">
+      <i class="fa-solid fa-plus" aria-hidden="true"></i> 新建提取
+    </a>
+  </div>
+</div>
+
+<div class="row g-4">
+  <div class="col-lg-7">
+    <section class="surface help-card">
+      <h2><i class="fa-solid fa-terminal" aria-hidden="true"></i> 启动</h2>
+      <p>在本项目的 Python 环境中安装依赖，然后从 <code>fig-extract/</code> 目录启动：</p>
+      <pre class="code-preview">python -m pip install -r requirements.txt
+python app.py</pre>
+      <p>浏览器打开 <a href="http://127.0.0.1:8501">http://127.0.0.1:8501</a>。默认监听
+        <code>127.0.0.1:8501</code>，只在本机可访问。</p>
+      <p>端口被占用时，可以临时指定：</p>
+      <pre class="code-preview">python app.py --port 8502</pre>
+      <p>也可以设置环境变量 <code>DIG_PORT</code> 或 <code>DIG_HOST</code>。使用期间保持终端运行。</p>
+      <p class="hint">网页依赖 Flask 与 Waitress；未安装 Waitress 时会退回 Flask 内置服务器，仍可正常使用。</p>
+    </section>
+
+    <section class="surface help-card">
+      <h2><i class="fa-solid fa-list-check" aria-hidden="true"></i> 提取流程</h2>
+      <ol class="help-list">
+        <li>在“开始提取”上传一篇或多篇 PDF，可再上传 <code>.txt</code>、<code>.dat</code> 或 <code>.csv</code> 模板。</li>
+        <li>填写图号或目标描述。留空会处理检测到的全部数据图；按内容、工况或子图条件找图由视觉模型完成。</li>
+        <li>选择“自动提取”或“仅分析，稍后确认坐标”。所有提取任务都使用视觉模型。</li>
+        <li>按需展开“更多设置”填写页码、DPI、批量并行数；页码使用 PDF 实际页序，从 1 开始，格式如 <code>3,5,7</code>。</li>
+        <li>提交后任务在后台运行。可以离开新建页，在“任务结果”中查看进度和日志。</li>
+        <li>任务列表可展开任务 ID，按文献查看每篇状态、结果数量和错误；文献右侧眼睛按钮进入该文献的核对视图，图像、数据、模板和报告只显示这一篇。详情页“文献核对”标签也按文献汇总。</li>
+        <li>完成后先按文献核对状态，在“图像核对”点图例确认当前曲线，再点选起点、拖动“采样间隔”。多条曲线重叠时，起点点击优先吸附当前曲线；点图例即可切换曲线。之后左侧编辑栏只修改当前曲线的采样点，可移动、擦除、补充，或新建未识别曲线；补充到端点时放好新点后双击端点即可。鼠标旁会显示 3× 圆形放大镜，方便对准点。右侧可修改轴标签和单位换算（× 倍率 + 偏移），确认绘制成图，颜色与左侧对应曲线一致；保存会把换算后的曲线写回 CSV，并更新轴范围和标签。</li>
+      </ol>
+      <p>“图像核对”只展示 <code>verify/</code> 中的结果叠加图，不包含被排除的候选图、裁剪图或诊断图。</p>
+    </section>
+
+    <section class="surface help-card">
+      <h2><i class="fa-solid fa-magnifying-glass-chart" aria-hidden="true"></i> 仅分析与坐标确认</h2>
+      <p>坐标轴较模糊或数值要求较严时，可先选“仅分析”。一次只能处理一篇 PDF；
+        确认坐标范围的操作仍在命令行完成：</p>
+      <pre class="code-preview">python run.py confirm &lt;配置文件路径&gt; --id &lt;面板ID&gt; --x 0,5 --y 0,70
+python run.py extract &lt;配置文件路径&gt;</pre>
+      <p>上面的范围仅为示例，请按原图刻度填写。确认后的配置文件可从任务详情的“日志与配置”下载。
+        网页与命令行使用同一套提取算法。</p>
+    </section>
+
+    <section class="surface help-card">
+      <h2><i class="fa-solid fa-key" aria-hidden="true"></i> API Key</h2>
+      <p>视觉模型需要 DeepSeek API Key。在“密钥设置”或新建页输入后，
+        勾选“记住”才会在提交任务时写入本机 <code>deepseek_key.txt</code>。页面不会回显已保存的密钥。</p>
+      <p>取消勾选“记住”时，新输入的密钥只用于当前任务，之前保存的密钥文件仍保留。
+        环境变量 <code>DEEPSEEK_API_KEY</code> 和 <code>secrets.json</code> 也可提供密钥。</p>
+      <p>保存的密钥不会写入任务配置、命令行参数、日志或结果压缩包；子进程只通过环境变量接收当前任务的密钥。</p>
+    </section>
+  </div>
+
+  <div class="col-lg-5">
+    <section class="surface help-card">
+      <h2><i class="fa-solid fa-signal" aria-hidden="true"></i> 状态含义</h2>
+      <div class="table-responsive">
+        <table class="table table-sm help-table">
+          <tbody>
+            <tr><th>排队中</th><td>已进入后台队列，尚未开始执行。</td></tr>
+            <tr><th>运行中</th><td>后台正在执行；页面可继续访问和刷新。</td></tr>
+            <tr><th>提取完成 · 待核对</th><td>已生成 CSV 或模板，但仍需人工检查核对图。</td></tr>
+            <tr><th>分析完成 · 待确认坐标</th><td>仅完成分析，需确认轴范围后再提取。</td></tr>
+            <tr><th>未提取到数据</th><td>命令正常结束，但没有 CSV 或模板。</td></tr>
+            <tr><th>部分失败</th><td>批量任务中有些论文失败，即使总体退出码为 0。</td></tr>
+            <tr><th>处理失败 / 已中断</th><td>处理程序异常退出，或服务重启时任务未完成。未自动重试。</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="hint">网页不会把未人工核对的结果显示为“已核对”。</p>
+    </section>
+
+    <section class="surface help-card">
+      <h2><i class="fa-solid fa-folder-tree" aria-hidden="true"></i> 文件位置</h2>
+      <ul class="help-list">
+        <li>上传文件、<code>ui-run.json</code>、<code>ui-run.log</code> 与结果保存在 <code>.ui_workspace/&lt;任务ID&gt;/</code>。</li>
+        <li>CSV 位于 <code>output/csv/</code>，核对图位于 <code>output/verify/</code>，报告、配置和模板也在 <code>output/</code> 下。</li>
+        <li>模型响应缓存位于 <code>.vlm_cache/</code>，调用明细位于 <code>.vlm_log.jsonl</code>。</li>
+        <li>这些本机文件默认已加入 Git 忽略规则；关闭浏览器不会删除任务。</li>
+      </ul>
+    </section>
+
+    <section class="surface help-card">
+      <h2><i class="fa-solid fa-circle-info" aria-hidden="true"></i> 需要注意</h2>
+      <ul class="help-list">
+        <li>这是本地单机网页，没有账户、权限或公网访问保护；默认只监听回环地址。</li>
+        <li>网页任务按提交顺序串行执行；每个批量任务内部仍可使用“批量并行数”。</li>
+        <li>服务重启会把未完成的排队/运行任务标为已中断，不会自动重跑或续跑。</li>
+        <li>自动结果需结合核对图复查；低清晰度、严重重叠和特殊图形可能提取不完整。</li>
+        <li>视觉模型调用可能产生费用并受网络/接口限流影响。已知页码时缩小范围可减少处理量。</li>
+        <li>本轮不提供任务删除、账户系统、数据矩阵或网页坐标编辑器。</li>
+      </ul>
+    </section>
+  </div>
+</div>
+{% endblock %}

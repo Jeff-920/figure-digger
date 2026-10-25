@@ -1,4 +1,4 @@
-"""Extract data straight from a PDF's vector graphics - no rasterising, no OCR.
+"""Extract data straight from a PDF's vector graphics - no rasterising.
 
 When a figure is drawn with vector operators, the PDF already contains:
   * the exact polyline coordinates of every series (with its stroke colour), and
@@ -177,7 +177,7 @@ def _parse_number(text):
 def find_tick_labels(page, axes, x_band=26, y_band=46):
     """Real text objects just outside the frame -> (position, value) pairs.
 
-    No OCR involved: these are the PDF's own glyphs, so the values are exact.
+    These are the PDF's own glyphs, so the values are exact.
     """
     left, top, right, bottom = axes
     xs, ys = [], []
@@ -194,7 +194,7 @@ def find_tick_labels(page, axes, x_band=26, y_band=46):
 
 
 def find_figure_text(page, axes, band=42.0, cap=60):
-    """Axis titles and legend words around the frame - the PDF's own text, no OCR.
+    """Axis titles and legend words around the frame - the PDF's own text.
 
     Tick numbers are already handled by the calibration; what is left over is exactly
     the vocabulary a reader uses to describe a chart ("spray tip penetration" versus

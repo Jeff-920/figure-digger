@@ -10,8 +10,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from ui_utils import (RunOptions, build_command, collect_artifacts, make_archive,
-                      safe_filename, valid_pages, is_figure_number_request,
-                      save_api_key, clear_saved_api_key)
+                      safe_filename, valid_pages, save_api_key,
+                      clear_saved_api_key)
 
 
 class UiUtilsTests(unittest.TestCase):
@@ -51,24 +51,17 @@ class UiUtilsTests(unittest.TestCase):
         self.assertFalse(valid_pages("0"))
         self.assertFalse(valid_pages("1,0"))
 
-    def test_ocr_rejects_semantic_conditions_even_with_figure_number(self):
-        for want in ("Figure 5 中 800 bar 的曲线", "Figure 5(a)", "速度随时间"):
-            with self.subTest(want=want), self.assertRaises(ValueError):
-                build_command(Path("run.py"), [Path("a.pdf")], Path("out"), RunOptions(want=want))
-        for want in ("Figure 5", "图5", "圖5", "Fig. 5 and Figure 6"):
-            self.assertTrue(is_figure_number_request(want))
-
-    def test_disabled_vlm_controls_do_not_leak_to_ocr(self):
+    def test_non_vlm_command_omits_model_only_flags(self):
         cmd = build_command(Path("run.py"), [Path("a.pdf")], Path("out"),
                             RunOptions(use_vlm=False, want_deep=True, find_series=False))
-        self.assertIn("--ocr", cmd)
+        self.assertNotIn("--vlm", cmd)
         self.assertNotIn("--want-deep", cmd)
         self.assertNotIn("--no-find-series", cmd)
 
     def test_vlm_defaults_and_force_match_cli(self):
         cmd = build_command(Path("run.py"), [Path("a.pdf")], Path("out"),
                             RunOptions(use_vlm=True, force=False, want="800 bar 速度随时间"))
-        self.assertIn("--no-ocr", cmd)
+        self.assertIn("--vlm", cmd)
         self.assertNotIn("--force", cmd)
         self.assertEqual(cmd[cmd.index("--want") + 1], "800 bar 速度随时间")
 
@@ -81,13 +74,12 @@ class UiUtilsTests(unittest.TestCase):
 
     def test_single_pdf_command_covers_ui_options(self):
         opts = RunOptions(dpi=400, pages="3, 5", force=True, use_vlm=True,
-                          use_ocr=True, want="Figure 5", want_deep=True,
+                          want="Figure 5", want_deep=True,
                           keep_intermediates=True, template=Path("format.dat"))
         command = build_command(Path("run.py"), [Path("paper.pdf")], Path("out"), opts)
         self.assertIn("all", command)
         self.assertIn("--force", command)
         self.assertIn("--vlm", command)
-        self.assertIn("--ocr", command)
         self.assertEqual(command[command.index("--pages") + 1], "3,5")
         self.assertEqual(command[command.index("--want") + 1], "Figure 5")
         self.assertIn("--template", command)
@@ -105,7 +97,7 @@ class UiUtilsTests(unittest.TestCase):
             with self.subTest(count=count, analyze=analyze_only):
                 command = build_command(Path("run.py"),
                     [Path(f"papers/{i}.pdf") for i in range(count)], Path("out"),
-                    RunOptions(use_vlm=True, use_ocr=True, want="Figure 5 的速度曲线",
+                    RunOptions(use_vlm=True, want="Figure 5 的速度曲线",
                                dpi=400, pages="3, 5", want_deep=True, find_series=False,
                                jobs=3, model="test-model", base_url="http://localhost:1234"),
                     analyze_only=analyze_only)
@@ -119,7 +111,6 @@ class UiUtilsTests(unittest.TestCase):
                 kwargs = (batch if target == "batch" else analyze).call_args.kwargs
                 self.assertEqual(kwargs["want"], "Figure 5 的速度曲线")
                 self.assertEqual(kwargs["pages"], "3,5")
-                self.assertTrue(kwargs["use_ocr"])
                 self.assertTrue(kwargs["want_deep"])
                 self.assertFalse(kwargs["find_series"])
                 self.assertEqual(client.call_args.kwargs["model"], "test-model")

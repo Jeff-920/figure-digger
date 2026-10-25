@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import time
+from functools import lru_cache
 from threading import RLock
 import urllib.error
 import urllib.request
@@ -77,11 +78,11 @@ def load_api_key(explicit=None):
     return None
 
 
-def prepare_image(image_path):
-    """Return (data_uri, sha256). PNG/JPEG in, downscaled only if oversized."""
+def _prepare_image_cached(path_str, mtime_ns, size):
+    """Encode one image; cached by path/mtime/size in the current process."""
     from PIL import Image
 
-    raw = Path(image_path).read_bytes()
+    raw = Path(path_str).read_bytes()
     img = Image.open(io.BytesIO(raw))
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
@@ -99,6 +100,23 @@ def prepare_image(image_path):
         mime = "image/jpeg"
     digest = hashlib.sha256(data).hexdigest()
     return f"data:{mime};base64," + base64.b64encode(data).decode("ascii"), digest
+
+
+@lru_cache(maxsize=64)
+def _prepare_image_cached_entry(path_str, mtime_ns, size):
+    return _prepare_image_cached(path_str, mtime_ns, size)
+
+
+def prepare_image(image_path):
+    """Return (data_uri, sha256). PNG/JPEG in, downscaled only if oversized.
+
+    VLM tasks reuse the same panel image for several prompts.  Re-encoding a
+    250 KB PNG costs ~90 ms each time, so cache by path + mtime + size in the
+    process; this is the same invalidation key a small local file cache uses.
+    """
+    path = Path(image_path).resolve()
+    stat = path.stat()
+    return _prepare_image_cached_entry(str(path), stat.st_mtime_ns, stat.st_size)
 
 
 class DeepSeekVLM:
@@ -235,9 +253,15 @@ class DeepSeekVLM:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
-        blocks = [{"type": "text", "text": prompt}]
+        # Put images before the task text.  DeepSeek's context cache matches a
+        # prefix of the request; different questions about the same panel image
+        # then share the system+image prefix instead of missing it as soon as
+        # the question text changes.  Image order is preserved for multi-image
+        # calls ("第一张图" still refers to the first image block).
+        blocks = []
         for data_uri, _image_digest in prepared:
             blocks.append({"type": "image_url", "image_url": {"url": data_uri}})
+        blocks.append({"type": "text", "text": prompt})
         messages.append({"role": "user", "content": blocks})
         payload = self._payload(messages, json_mode=json_mode, max_tokens=max_tokens,
                                 temperature=temperature)

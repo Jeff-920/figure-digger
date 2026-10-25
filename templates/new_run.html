@@ -1,0 +1,214 @@
+{% extends "base.html" %}
+{% block title %}新建提取 · DIG Studio{% endblock %}
+{% block content %}
+<div class="page-toolbar">
+  <div class="page-heading">
+    <div class="page-title-row">
+      <span class="page-icon"><i class="fa-solid fa-file-circle-plus" aria-hidden="true"></i></span>
+      <h1 class="page-title">新建提取</h1>
+    </div>
+    <p class="page-subtitle">上传 PDF 并选择提取方式。任务提交后在后台运行，可以离开本页。</p>
+  </div>
+  <div class="toolbar-actions">
+    <a class="btn btn-outline-secondary" href="{{ url_for('main.index') }}">
+      <i class="fa-solid fa-arrow-left" aria-hidden="true"></i> 返回任务结果
+    </a>
+  </div>
+</div>
+
+{% if errors %}
+<div class="alert alert-danger" role="alert">
+  <p class="mb-2"><i class="fa-solid fa-circle-exclamation" aria-hidden="true"></i> <strong>无法提交这个任务：</strong></p>
+  <ul class="mb-2">
+    {% for error in errors %}<li>{{ error }}</li>{% endfor %}
+  </ul>
+  <p class="mb-0 small">修改后请重新选择文件并提交。</p>
+</div>
+{% endif %}
+
+<form id="new-run-form" method="post" action="{{ url_for('main.create_run') }}" enctype="multipart/form-data">
+  <div class="surface new-run-shell">
+    <div class="row g-0">
+      <div class="col-lg-7">
+        <section class="new-run-section" aria-labelledby="paperHeading">
+          <div class="section-heading">
+            <span class="step">01</span>
+            <div>
+              <h2 id="paperHeading">论文与目标</h2>
+              <p>上传一篇或多篇 PDF；已知图号时直接填写，能减少无关处理。</p>
+            </div>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label" for="pdfs">PDF 文件</label>
+            <input class="form-control" id="pdfs" name="pdfs" type="file"
+                   accept=".pdf,application/pdf" multiple required>
+            <div class="form-text">可多选。文件名冲突时会自动重命名；页数在文件选择后读取，提交时服务器会再次校验。</div>
+            <div class="file-list" id="pdf-file-list"
+                 data-info-url="{{ url_for('main.pdf_info') }}" aria-live="polite">
+              <p class="file-empty">选择后显示文件名、页数和大小。</p>
+            </div>
+            <p class="file-info-error" id="pdf-info-error" role="status"></p>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label" for="want">想提取哪张图？</label>
+            <textarea class="form-control" id="want" name="want" rows="3"
+                      placeholder="例如：Figure 5，或 800 bar 条件下速度随时间的曲线">{{ form.want }}</textarea>
+            <div class="form-text">留空会处理检测到的全部数据图。按图号、文字描述或工况找图均由视觉模型完成。</div>
+          </div>
+
+          <div>
+            <label class="form-label" for="template">按模板导出（可选）</label>
+            <input class="form-control" id="template" name="template" type="file"
+                   accept=".txt,.dat,.csv" data-auto-only{% if form.mode != 'auto' %} disabled{% endif %}>
+            <div class="form-text">支持 .txt、.dat、.csv。模板导出需要自动提取。</div>
+          </div>
+        </section>
+      </div>
+
+      <div class="col-lg-5">
+        <section class="new-run-section new-run-aside" aria-labelledby="settingsHeading">
+          <div class="section-heading">
+            <span class="step">02</span>
+            <div>
+              <h2 id="settingsHeading">提取设置</h2>
+              <p>所有任务都使用视觉模型；高级参数按需展开。</p>
+            </div>
+          </div>
+
+          <fieldset class="mb-3">
+            <legend class="form-label">流程</legend>
+            <div class="form-check option-row">
+              <input class="form-check-input" type="radio" name="mode" id="modeAuto" value="auto"
+                     {% if form.mode == 'auto' %}checked{% endif %}>
+              <label class="form-check-label" for="modeAuto">
+                <span>自动提取</span>
+                <small>直接使用识别到的轴范围，完成后请核对数据。</small>
+              </label>
+            </div>
+            <div class="form-check option-row">
+              <input class="form-check-input" type="radio" name="mode" id="modeAnalyze" value="analyze"
+                     {% if form.mode == 'analyze' %}checked{% endif %}>
+              <label class="form-check-label" for="modeAnalyze">
+                <span>仅分析，稍后确认坐标</span>
+                <small>生成配置供确认；一次只处理一篇 PDF。</small>
+              </label>
+            </div>
+          </fieldset>
+
+          <div class="key-panel">
+            <label class="form-label" for="apiKey">DeepSeek API Key</label>
+            <input class="form-control" id="apiKey" name="api_key" type="password"
+                   autocomplete="new-password" placeholder="留空使用本机已保存的密钥">
+            <div class="form-check mt-2">
+              <input class="form-check-input" type="checkbox" id="rememberKey" name="remember_key"
+                     {% if form.remember_key %}checked{% endif %}>
+              <label class="form-check-label" for="rememberKey">记住 API Key（保存在本机）</label>
+            </div>
+            <div class="key-status-line{% if key_status.ready %} key-ready{% else %} key-missing{% endif %}">
+              {% if key_status.ready %}
+              <i class="fa-solid fa-circle-check" aria-hidden="true"></i>
+              已检测到可用密钥（{{ key_status.source }}）
+              {% else %}
+              <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+              未检测到可用密钥；视觉模型需要填写。
+              {% endif %}
+            </div>
+            <div class="form-text">已保存的密钥不会回填；输入新密钥并勾选记住后，会在提交任务时保存。密钥不会进入任务日志或下载包。</div>
+          </div>
+
+          <details class="advanced-settings">
+            <summary><i class="fa-solid fa-sliders" aria-hidden="true"></i> 更多设置</summary>
+            <div class="row g-3 mt-1">
+              <div class="col-sm-6">
+                <label class="form-label" for="pages">指定页码</label>
+                <input class="form-control" id="pages" name="pages" type="text" value="{{ form.pages }}"
+                       placeholder="如 3,5,7">
+                <div class="form-text">PDF 实际页序，从 1 开始。</div>
+              </div>
+              <div class="col-sm-6">
+                <label class="form-label" for="dpi">渲染精度 (DPI)</label>
+                <select class="form-select" id="dpi" name="dpi">
+                  {% for value in [150, 200, 300, 400, 600] %}
+                  <option value="{{ value }}"{% if form.dpi|string == value|string %} selected{% endif %}>{{ value }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="col-sm-6">
+                <label class="form-label" for="jobs">批量并行数</label>
+                <select class="form-select" id="jobs" name="jobs">
+                  {% for value in range(1, 9) %}
+                  <option value="{{ value }}"{% if form.jobs|string == value|string %} selected{% endif %}>{{ value }}</option>
+                  {% endfor %}
+                </select>
+                <div class="form-text">仅多篇批量任务生效。</div>
+              </div>
+            </div>
+
+            <div class="advanced-checks">
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" role="switch" id="wantDeep" name="want_deep"
+                       {% if form.want_deep %}checked{% endif %}>
+                <label class="form-check-label" for="wantDeep">结合正文核对图意</label>
+              </div>
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" role="switch" id="findSeries" name="find_series"
+                       {% if form.find_series %}checked{% endif %}>
+                <label class="form-check-label" for="findSeries">自动识别曲线</label>
+              </div>
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" role="switch" id="forceAxis" name="force"
+                       {% if form.force %}checked{% endif %} data-auto-only{% if form.mode != 'auto' %} disabled{% endif %}>
+                <label class="form-check-label" for="forceAxis">接受未确认的自动轴范围</label>
+              </div>
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" role="switch" id="keepIntermediates" name="keep_intermediates"
+                       {% if form.keep_intermediates %}checked{% endif %}>
+                <label class="form-check-label" for="keepIntermediates">保留诊断图片</label>
+              </div>
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" role="switch" id="verbose" name="verbose"
+                       {% if form.verbose %}checked{% endif %}>
+                <label class="form-check-label" for="verbose">记录详细日志</label>
+              </div>
+            </div>
+
+            <div class="row g-3">
+              <div class="col-sm-6">
+                <label class="form-label" for="model">模型名称</label>
+                <input class="form-control" id="model" name="model" type="text" value="{{ form.model }}">
+              </div>
+              <div class="col-sm-6">
+                <label class="form-label" for="baseUrl">接口地址</label>
+                <input class="form-control" id="baseUrl" name="base_url" type="url" value="{{ form.base_url }}">
+              </div>
+            </div>
+          </details>
+        </section>
+      </div>
+    </div>
+
+    <div class="new-run-footer">
+      <div class="summary-block">
+        <div class="summary-inline">
+          <span class="summary-item"><i class="fa-solid fa-file-pdf" aria-hidden="true"></i>
+            文件 <strong id="summary-files">尚未选择</strong></span>
+          <span class="summary-item"><i class="fa-solid fa-diagram-project" aria-hidden="true"></i>
+            流程 <strong id="summary-mode">{% if form.mode == 'auto' %}自动提取{% else %}仅分析，稍后确认坐标{% endif %}</strong></span>
+          <span class="summary-item"><i class="fa-solid fa-gauge-high" aria-hidden="true"></i>
+            <strong id="summary-dpi">{{ form.dpi }} DPI</strong></span>
+          <span class="summary-item"><i class="fa-solid fa-bullseye" aria-hidden="true"></i>
+            <strong id="summary-want">{{ form.want.strip() or '全部数据图' }}</strong></span>
+          <span class="summary-item"><i class="fa-solid fa-list-ol" aria-hidden="true"></i>
+            页码 <strong id="summary-pages">{{ form.pages or '全部' }}</strong></span>
+        </div>
+        <p class="summary-note">提交后任务在后台执行；刷新或关闭页面不会中断。结果在“任务结果”中按文献核对。</p>
+      </div>
+      <button class="btn btn-primary" type="submit" id="submit-run">
+        <i class="fa-solid fa-play" aria-hidden="true"></i> 开始处理 PDF
+      </button>
+    </div>
+  </div>
+</form>
+{% endblock %}

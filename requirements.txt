@@ -1,4 +1,3 @@
-# 完整安装：提取算法、网页界面及可选 OCR（Python 3.10+）。
+# 完整安装：提取算法与网页界面（Python 3.10+）。
 -r requirements-core.txt
 -r requirements-web.txt
--r requirements-ocr.txt

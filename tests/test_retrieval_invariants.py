@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT), str(ROOT / "dig")]
 
 import batch_extract as be
-import axis_ranges as ar
+import axis_calibration as ac
 import extract_lines as el
 import figure_index as fi
 import imgio as iio
@@ -680,7 +680,7 @@ class TickAndLegendTests(unittest.TestCase):
         reading = {'x':None,'y_axes':[{'side':'left','scale':'linear','min':0,'max':100,
                     'ticks':[{'value':0,'position':0},{'value':50,'position':.42},
                              {'value':100,'position':.83}]}]}
-        result = ar.calibrate_vlm_ticks(img,frame,reading)['y_axes'][0]
+        result = ac.calibrate_vlm_ticks(img,frame,reading)['y_axes'][0]
         self.assertEqual(result['max'],120.)
         self.assertTrue(result['tick_calibration']['accepted'])
 

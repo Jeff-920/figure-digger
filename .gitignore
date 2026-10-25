@@ -8,6 +8,7 @@ secrets.json
 .streamlit/secrets.toml
 
 # 输入与运行产物
+tests/
 output/
 out*/
 *_out/
@@ -18,6 +19,7 @@ papers/
 
 # 缓存与日志
 .vlm_cache/
+.analysis_cache/
 .vlm_log.jsonl
 .templates/
 .ui_workspace/

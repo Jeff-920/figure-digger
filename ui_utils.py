@@ -1,7 +1,7 @@
-"""Small, dependency-free helpers for the Streamlit interface.
+"""Small, dependency-free helpers shared by the web interface and the CLI tests.
 
-Keeping command construction and artifact discovery outside ``app.py`` makes the
-UI thin and lets us test the potentially error-prone filesystem/CLI boundary.
+Keeping command construction and artifact discovery outside the web routes makes
+the UI thin and lets us test the potentially error-prone filesystem/CLI boundary.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from typing import Iterable
 
 _UNSAFE_FILENAME = re.compile(r"[^\w.\-()\u4e00-\u9fff]+", re.UNICODE)
 _PAGES = re.compile(r"^\s*\d+(?:\s*,\s*\d+)*\s*$")
-_FIGURE_NUMBER = re.compile(r"(?:fig(?:ure)?s?\.?|图|圖)\s*(\d+)", re.I)
 
 
 def save_api_key(root: Path, key: str) -> None:
@@ -51,14 +50,6 @@ def clear_saved_api_key(root: Path) -> None:
     (root / "deepseek_key.txt").unlink(missing_ok=True)
 
 
-def is_figure_number_request(value: str) -> bool:
-    """Use the same pure-number grammar as figure_index.local_match."""
-    if not _FIGURE_NUMBER.search(value):
-        return False
-    remainder = _FIGURE_NUMBER.sub("", value)
-    return not re.sub(r"\b(?:and|or)\b|[\s,，、;；与和及]", "", remainder, flags=re.I)
-
-
 @dataclass(frozen=True)
 class RunOptions:
     """Options shared by the one-shot and batch commands."""
@@ -67,7 +58,6 @@ class RunOptions:
     pages: str = ""
     force: bool = True
     use_vlm: bool = False
-    use_ocr: bool = False
     want: str = ""
     want_deep: bool = False
     find_series: bool = True
@@ -110,8 +100,6 @@ def build_command(
         raise ValueError("仅分析模式一次只能处理一份 PDF")
     if not valid_pages(options.pages):
         raise ValueError("页码应从 1 开始，格式为 7 或 3,5,7")
-    if options.want.strip() and not options.use_vlm and not is_figure_number_request(options.want):
-        raise ValueError("本地 OCR 仅支持纯图号（如 Figure 5）；内容、工况和子图条件需要视觉模型")
     if options.template is not None and (not options.use_vlm or analyze_only):
         raise ValueError("模板导出需要自动提取模式和视觉模型")
 
@@ -133,10 +121,6 @@ def build_command(
             command.extend(["--vlm-model", options.model.strip()])
         if options.base_url.strip():
             command.extend(["--vlm-base-url", options.base_url.strip()])
-    if not options.use_vlm or options.use_ocr:
-        command.append("--ocr")
-    elif options.use_vlm:
-        command.append("--no-ocr")
     if options.want.strip():
         command.extend(["--want", options.want.strip()])
     if options.use_vlm and options.want_deep:
@@ -164,22 +148,28 @@ def collect_artifacts(output_dir: Path) -> dict[str, list[Path]]:
     }
     if not output_dir.exists():
         return found
-    for path in output_dir.rglob("*"):
-        if not path.is_file():
-            continue
-        suffix = path.suffix.lower()
-        if "templates" in path.relative_to(output_dir).parts:
-            found["templates"].append(path)
-        elif suffix == ".csv" and "csv" in path.relative_to(output_dir).parts:
-            found["csv"].append(path)
-        elif path.name in {"report.md", "batch_summary.md"}:
-            found["reports"].append(path)
-        # Retrieval candidates include rejected figures and diagnostic crops.
-        # Only the extraction overlays belong in the image review dashboard.
-        elif suffix in {".png", ".jpg", ".jpeg"} and path.parent.name == "verify":
-            found["images"].append(path)
-        elif path.name.endswith("_config.json") or path.name == "paper_config.json":
-            found["configs"].append(path)
+    # Skip the large diagnostic/render directories: they never contain a
+    # dashboard artifact, and walking them dominates history-page latency on
+    # papers with many panels.
+    skip_dirs = {"objects", "panels", "figures"}
+    for root, dirs, files in os.walk(output_dir):
+        dirs[:] = [name for name in dirs if name.lower() not in skip_dirs]
+        root_path = Path(root)
+        for name in files:
+            path = root_path / name
+            suffix = path.suffix.lower()
+            if "templates" in path.relative_to(output_dir).parts:
+                found["templates"].append(path)
+            elif suffix == ".csv" and "csv" in path.relative_to(output_dir).parts:
+                found["csv"].append(path)
+            elif name in {"report.md", "batch_summary.md"}:
+                found["reports"].append(path)
+            # Retrieval candidates include rejected figures and diagnostic crops.
+            # Only the extraction overlays belong in the image review dashboard.
+            elif suffix in {".png", ".jpg", ".jpeg"} and path.parent.name == "verify":
+                found["images"].append(path)
+            elif name.endswith("_config.json") or name == "paper_config.json":
+                found["configs"].append(path)
     for values in found.values():
         values.sort(key=lambda item: item.as_posix().lower())
     return found
@@ -195,8 +185,9 @@ def result_status(metadata: dict, artifacts: dict) -> str:
     return "提取完成 · 请核对数据"
 
 
-def batch_failures(output: Path) -> list[str]:
-    """The batch CLI can exit successfully while individual papers fail."""
+def batch_rows(output: Path) -> list[dict]:
+    """Return the per-paper rows written by the batch CLI, if present."""
+
     path = output / "batch_summary.json"
     if not path.exists():
         return []
@@ -205,7 +196,12 @@ def batch_failures(output: Path) -> list[str]:
     except (OSError, ValueError):
         return []
     rows = data if isinstance(data, list) else data.get("rows", []) if isinstance(data, dict) else []
-    return [str(row.get("pdf", "未知文件")) for row in rows if isinstance(row, dict) and row.get("error")]
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def batch_failures(output: Path) -> list[str]:
+    """The batch CLI can exit successfully while individual papers fail."""
+    return [str(row.get("pdf", "未知文件")) for row in batch_rows(output) if row.get("error")]
 
 
 def make_archive(output_dir: Path) -> bytes:

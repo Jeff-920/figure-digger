@@ -1,0 +1,173 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge, empty_state, paper_table %}
+{% block title %}任务结果 · DIG Studio{% endblock %}
+{% block content %}
+<div class="page-toolbar">
+  <div class="page-heading">
+    <div class="page-title-row">
+      <span class="page-icon"><i class="fa-solid fa-table-list" aria-hidden="true"></i></span>
+      <h1 class="page-title">任务结果</h1>
+    </div>
+    <p class="page-subtitle">查看本机提取任务的状态、核对图、报告与数据下载。</p>
+  </div>
+  <div class="toolbar-actions">
+    <form class="search-form" method="get" action="{{ url_for('main.index') }}" role="search">
+      {% for key in ['status', 'mode'] %}
+        {% if filters.get(key) %}<input type="hidden" name="{{ key }}" value="{{ filters[key] }}">{% endif %}
+      {% endfor %}
+      <div class="input-group">
+        <span class="input-group-text"><i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i></span>
+        <input class="form-control" type="search" name="q" value="{{ q }}"
+               placeholder="搜索文件名、任务 ID 或提取目标" aria-label="搜索任务">
+        <button class="btn btn-primary" type="submit">搜索</button>
+      </div>
+    </form>
+    <a class="btn btn-primary" href="{{ url_for('main.new_run') }}">
+      <i class="fa-solid fa-plus" aria-hidden="true"></i> 新建提取
+    </a>
+  </div>
+</div>
+
+<section class="surface filter-card" aria-labelledby="filterTitle">
+  <div class="surface-head">
+    <h2 class="surface-title" id="filterTitle">
+      <i class="fa-solid fa-filter" aria-hidden="true"></i> 任务筛选
+    </h2>
+    <span class="surface-meta">匹配 {{ matched_count }} 个任务</span>
+  </div>
+  <form method="get" action="{{ url_for('main.index') }}" class="filters-grid">
+    <input type="hidden" name="q" value="{{ q }}">
+    <div>
+      <label class="form-label" for="statusFilter">处理状态</label>
+      <select class="form-select" id="statusFilter" name="status" data-auto-submit>
+        <option value="all"{% if status_filter == 'all' %} selected{% endif %}>全部状态</option>
+        <option value="active"{% if status_filter == 'active' %} selected{% endif %}>排队中 / 运行中</option>
+        <option value="review"{% if status_filter == 'review' %} selected{% endif %}>提取完成 · 待核对</option>
+        <option value="analyze"{% if status_filter == 'analyze' %} selected{% endif %}>分析完成 · 待确认坐标</option>
+        <option value="empty"{% if status_filter == 'empty' %} selected{% endif %}>未提取到数据</option>
+        <option value="partial"{% if status_filter == 'partial' %} selected{% endif %}>部分失败</option>
+        <option value="failed"{% if status_filter == 'failed' %} selected{% endif %}>失败 / 已中断</option>
+      </select>
+    </div>
+    <div>
+      <label class="form-label" for="modeFilter">流程</label>
+      <select class="form-select" id="modeFilter" name="mode" data-auto-submit>
+        <option value="all"{% if mode_filter == 'all' %} selected{% endif %}>全部流程</option>
+        <option value="auto"{% if mode_filter == 'auto' %} selected{% endif %}>自动提取</option>
+        <option value="analyze"{% if mode_filter == 'analyze' %} selected{% endif %}>仅分析</option>
+        <option value="unknown"{% if mode_filter == 'unknown' %} selected{% endif %}>未记录</option>
+      </select>
+    </div>
+    <div class="filter-actions">
+      <button class="btn btn-outline-primary" type="submit">应用筛选</button>
+      <a class="btn btn-link" href="{{ url_for('main.index') }}">重置</a>
+    </div>
+  </form>
+</section>
+
+<section class="surface table-card" aria-label="本机提取任务列表">
+  {% if views %}
+  <div class="table-responsive">
+    <table class="table dig-table align-middle">
+      <caption class="visually-hidden">本机提取任务列表</caption>
+      <thead>
+        <tr>
+          <th scope="col" class="col-index">#</th>
+          <th scope="col">任务 ID</th>
+          <th scope="col">论文 / 文件</th>
+          <th scope="col">提取目标</th>
+          <th scope="col">流程</th>
+          <th scope="col">创建时间</th>
+          <th scope="col">耗时</th>
+          <th scope="col">结果</th>
+          <th scope="col">状态</th>
+          <th scope="col" class="text-end">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for view in views %}
+        <tr>
+          <td class="col-index num">{{ (page - 1) * per_page + loop.index }}</td>
+          <td>
+            <button class="task-toggle" type="button" data-bs-toggle="collapse"
+                    data-bs-target="#papers-{{ view.run_id }}" aria-expanded="false"
+                    aria-controls="papers-{{ view.run_id }}"
+                    title="{{ view.run_id }} · 展开文献状态">
+              <i class="fa-solid fa-chevron-right" aria-hidden="true"></i>
+              <span class="mono">{{ view.short_id }}</span>
+              <span class="paper-badge">{{ view.paper_count }} 篇</span>
+            </button>
+          </td>
+          <td>
+            <div class="cell-clamp cell-file" title="{{ view.label }}">{{ view.file_summary }}</div>
+          </td>
+          <td>
+            <div class="cell-clamp cell-want" title="{{ view.want }}">{{ view.want }}</div>
+          </td>
+          <td class="text-nowrap" title="{{ view.mode }}">{{ view.mode_short }}</td>
+          <td class="text-nowrap" title="{{ view.created_iso }}">{{ view.created|clock }}</td>
+          <td class="text-nowrap num">{% if view.state.key == 'queued' %}—{% else %}{{ view.elapsed|duration }}{% endif %}</td>
+          <td><span class="result-text" title="{{ view.result_summary }}">{{ view.result_summary }}</span></td>
+          <td>{{ status_badge(view.state, compact=True) }}</td>
+          <td>
+            <div class="icon-actions">
+              <a class="icon-btn" href="{{ url_for('main.run_detail', run_id=view.run_id) }}"
+                 title="查看任务详情" aria-label="查看任务详情">
+                <i class="fa-solid fa-eye" aria-hidden="true"></i>
+              </a>
+              {% if view.result_total %}
+              <a class="icon-btn" href="{{ url_for('main.download_archive', run_id=view.run_id) }}"
+                 data-busy title="下载全部结果" aria-label="下载全部结果">
+                <i class="fa-solid fa-download" aria-hidden="true"></i>
+              </a>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        <tr class="papers-row">
+          <td colspan="10">
+            <div class="collapse" id="papers-{{ view.run_id }}">
+              <div class="papers-panel">
+                <div class="papers-panel-head">
+                  <span><i class="fa-solid fa-file-circle-check" aria-hidden="true"></i>
+                    文献状态 · {{ view.paper_count }} 篇{% if view.failed_paper_count %}
+                    · {{ view.failed_paper_count }} 篇失败{% endif %}</span>
+                  <span class="mono">{{ view.run_id }}</span>
+                </div>
+                {{ paper_table(view.papers, view.run_id) }}
+              </div>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="table-foot">
+    <span>
+      显示第 {{ (page - 1) * per_page + 1 }}–{{ (page - 1) * per_page + views|length }} 条，
+      共 {{ matched_count }} 条匹配任务 · 按创建时间倒序 · 每页 {{ per_page }} 条
+    </span>
+    {% if pages > 1 %}
+    <nav aria-label="任务分页">
+      <ul class="pagination pagination-sm mb-0">
+        <li class="page-item{% if page <= 1 %} disabled{% endif %}">
+          <a class="page-link" href="{{ page_url(page - 1) }}"{% if page <= 1 %} tabindex="-1" aria-disabled="true"{% endif %}>上一页</a>
+        </li>
+        <li class="page-item disabled"><span class="page-link">{{ page }} / {{ pages }}</span></li>
+        <li class="page-item{% if page >= pages %} disabled{% endif %}">
+          <a class="page-link" href="{{ page_url(page + 1) }}"{% if page >= pages %} tabindex="-1" aria-disabled="true"{% endif %}>下一页</a>
+        </li>
+      </ul>
+    </nav>
+    {% endif %}
+  </div>
+  {% elif total == 0 %}
+    {{ empty_state('fa-inbox', '还没有任务', '上传 PDF 后，任务结果、日志和核对图会保存在这台机器上，关闭浏览器也不会丢失。',
+                   url_for('main.new_run'), '新建提取') }}
+  {% else %}
+    {{ empty_state('fa-magnifying-glass', '没有匹配的任务', '调整搜索词或筛选条件，也可以清除筛选查看全部任务。',
+                   url_for('main.index'), '清除筛选') }}
+  {% endif %}
+</section>
+{% endblock %}

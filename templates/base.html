@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}DIG Studio{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/bootstrap/bootstrap.min.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/fontawesome/css/all.min.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+  <nav class="navbar navbar-expand-lg dig-navbar sticky-top">
+    <div class="container-xxl dig-nav-inner">
+      <a class="navbar-brand" href="{{ url_for('main.index') }}" aria-label="DIG 任务结果首页">
+        <span class="dig-logo"><i class="fa-solid fa-chart-line" aria-hidden="true"></i></span>
+        <span class="dig-brand-text">DIG <small>/ Studio</small></span>
+      </a>
+      <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#digNavbar"
+              aria-controls="digNavbar" aria-expanded="false" aria-label="切换导航">
+        <i class="fa-solid fa-bars" aria-hidden="true"></i>
+      </button>
+      <div class="collapse navbar-collapse" id="digNavbar">
+        <ul class="navbar-nav dig-nav-links me-auto">
+          <li class="nav-item">
+            <a class="nav-link{% if nav_section == 'new' %} active{% endif %}" href="{{ url_for('main.new_run') }}">
+              <i class="fa-solid fa-file-circle-plus" aria-hidden="true"></i> 开始提取
+            </a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link{% if nav_section == 'runs' %} active{% endif %}" href="{{ url_for('main.index') }}">
+              <i class="fa-solid fa-table-list" aria-hidden="true"></i> 任务结果
+            </a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link{% if nav_section == 'help' %} active{% endif %}" href="{{ url_for('main.help_page') }}">
+              <i class="fa-solid fa-circle-question" aria-hidden="true"></i> 使用说明
+            </a>
+          </li>
+        </ul>
+        <div class="dig-nav-actions">
+          {% if key_status.ready %}
+          <span class="key-state key-ready" title="{{ key_status.source }}">
+            <i class="fa-solid fa-key" aria-hidden="true"></i> 密钥已就绪
+          </span>
+          {% else %}
+          <span class="key-state key-missing">
+            <i class="fa-solid fa-key" aria-hidden="true"></i> 未配置密钥
+          </span>
+          {% endif %}
+          <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="modal" data-bs-target="#keyModal">
+            <i class="fa-solid fa-gear" aria-hidden="true"></i> 密钥设置
+          </button>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container-xxl dig-main">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+      <div class="flash-stack">
+        {% for category, message in messages %}
+        {% set tone = category if category in ['success', 'warning', 'danger', 'info'] else 'info' %}
+        <div class="alert alert-{{ tone }} alert-dismissible fade show" role="alert">
+          <i class="fa-solid {% if tone == 'success' %}fa-circle-check{% elif tone == 'danger' %}fa-circle-exclamation{% elif tone == 'warning' %}fa-triangle-exclamation{% else %}fa-circle-info{% endif %}" aria-hidden="true"></i>
+          <span>{{ message }}</span>
+          <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="关闭"></button>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="dig-footer">
+    <span>DIG · Data from Images and Graphs · 本地运行</span>
+    <span>任务目录：<code>.ui_workspace/</code></span>
+  </footer>
+
+  <div class="modal fade" id="keyModal" tabindex="-1" aria-labelledby="keyModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2 class="modal-title fs-5" id="keyModalLabel">
+            <i class="fa-solid fa-key" aria-hidden="true"></i> API Key 设置
+          </h2>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+        </div>
+        <div class="modal-body">
+          <div class="key-overview">
+            {% if key_status.ready %}
+            <p><i class="fa-solid fa-circle-check text-success" aria-hidden="true"></i>
+              当前可使用密钥：<strong>{{ key_status.source }}</strong></p>
+            {% else %}
+            <p><i class="fa-solid fa-triangle-exclamation text-warning" aria-hidden="true"></i>
+              当前没有可用密钥。视觉模型调用需要先保存 API Key。</p>
+            {% endif %}
+            {% if key_status.saved %}
+            <p class="mb-3">本机已保存 <code>deepseek_key.txt</code>。页面不会回显已保存的密钥。</p>
+            {% else %}
+            <p class="mb-3">本机尚未保存密钥文件。</p>
+            {% endif %}
+          </div>
+
+          <form method="post" action="{{ url_for('main.save_key') }}" class="key-form">
+            <input type="hidden" name="next" value="{{ request.full_path.rstrip('?') }}">
+            <label class="form-label" for="savedKeyInput">保存新的 API Key</label>
+            <input class="form-control" id="savedKeyInput" name="api_key" type="password"
+                   autocomplete="new-password" placeholder="输入后保存到本机" required>
+            <div class="form-text">保存到项目根目录的 <code>deepseek_key.txt</code>，不会写入任务日志或下载包。</div>
+            <button class="btn btn-primary btn-sm mt-2" type="submit">
+              <i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> 保存密钥
+            </button>
+          </form>
+
+          <hr>
+
+          <form method="post" action="{{ url_for('main.clear_key') }}" class="key-form">
+            <input type="hidden" name="next" value="{{ request.full_path.rstrip('?') }}">
+            <p class="mb-2">删除本机保存的密钥文件；环境变量中的密钥不受影响。</p>
+            <button class="btn btn-outline-danger btn-sm" type="submit"{% if not key_status.saved %} disabled{% endif %}>
+              <i class="fa-solid fa-trash-can" aria-hidden="true"></i> 清除已保存密钥
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='vendor/bootstrap/bootstrap.bundle.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>
