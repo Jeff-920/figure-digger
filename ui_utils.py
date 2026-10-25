@@ -50,6 +50,35 @@ def clear_saved_api_key(root: Path) -> None:
     (root / "deepseek_key.txt").unlink(missing_ok=True)
 
 
+PREFS_NAME = ".ui-preferences.json"
+
+
+def load_ui_preferences(root: Path) -> dict:
+    """Read small local UI defaults; malformed files fall back to empty."""
+    try:
+        data = json.loads((root / PREFS_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_ui_preferences(root: Path, **updates: str) -> None:
+    """Persist local UI defaults atomically; never store secrets here."""
+    root.mkdir(parents=True, exist_ok=True)
+    preferences = load_ui_preferences(root)
+    preferences.update(updates)
+    pending = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root,
+                prefix=".ui-preferences-", suffix=".tmp", delete=False) as handle:
+            pending = Path(handle.name)
+            json.dump(preferences, handle, ensure_ascii=False, indent=2)
+        os.replace(pending, root / PREFS_NAME)
+    finally:
+        if pending is not None:
+            pending.unlink(missing_ok=True)
+
+
 @dataclass(frozen=True)
 class RunOptions:
     """Options shared by the one-shot and batch commands."""

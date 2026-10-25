@@ -43,7 +43,7 @@
             <label class="form-label" for="pdfs">PDF 文件</label>
             <input class="form-control" id="pdfs" name="pdfs" type="file"
                    accept=".pdf,application/pdf" multiple required>
-            <div class="form-text">可多选。文件名冲突时会自动重命名；页数在文件选择后读取，提交时服务器会再次校验。</div>
+            <div class="form-text">可多选，也可分多次从不同目录添加；每行右侧可移除。文件名冲突时会自动重命名；页数在文件选择后读取，提交时服务器会再次校验。</div>
             <div class="file-list" id="pdf-file-list"
                  data-info-url="{{ url_for('main.pdf_info') }}" aria-live="polite">
               <p class="file-empty">选择后显示文件名、页数和大小。</p>
@@ -53,9 +53,19 @@
 
           <div class="mb-3">
             <label class="form-label" for="want">想提取哪张图？</label>
-            <textarea class="form-control" id="want" name="want" rows="3"
+            <textarea class="form-control" id="want" name="want" rows="3" maxlength="500"
                       placeholder="例如：Figure 5，或 800 bar 条件下速度随时间的曲线">{{ form.want }}</textarea>
-            <div class="form-text">留空会处理检测到的全部数据图。按图号、文字描述或工况找图均由视觉模型完成。</div>
+            <div class="form-text">提交后自动记住本次目标，下次新建时预填，修改后以新内容为准；留空会处理全部数据图。</div>
+            <div class="figure-number-field">
+              <label class="form-label" for="figure">已知 Figure 编号（可选）</label>
+              <div class="figure-number-control">
+                <span class="figure-number-prefix">Figure</span>
+                <input class="form-control" id="figure" name="figure" type="number"
+                       min="1" max="9999" step="1" inputmode="numeric"
+                       placeholder="如 7" value="{{ form.figure }}">
+              </div>
+              <div class="form-text">填数字后直接按图号精确定位，优先于上面的描述。</div>
+            </div>
           </div>
 
           <div>

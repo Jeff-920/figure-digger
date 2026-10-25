@@ -90,7 +90,7 @@ _KEEP_INTERMEDIATES = False
 _INTERMEDIATE_DIRS = ("gaps", "review", "debug", "select", "objects")
 # Bump when analysis prompts/phases change; otherwise a cached config may be
 # reused across incompatible pipeline versions.
-ANALYSIS_CACHE_VERSION = 1
+ANALYSIS_CACHE_VERSION = 3
 ANALYSIS_CACHE_DIR = ROOT / ".analysis_cache"
 
 
@@ -3066,6 +3066,8 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None, report_us
                 page.crop(tuple(bbox), strict=False).to_image(resolution=300).original.save(crop_path)
                 frame_c = [(p["frame"][0] - bbox[0]) * scale, (p["frame"][1] - bbox[1]) * scale,
                            (p["frame"][2] - bbox[0]) * scale, (p["frame"][3] - bbox[1]) * scale]
+                results[p["id"]].update({"panel": crop_path.name, "frame": frame_c,
+                                         "frame_space": "pixels"})
                 make_verify_image(crop_path, frame_c, ax,
                                   [s["color"] for s in series],
                                   [csv_dir / s["file"] for s in series],

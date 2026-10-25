@@ -103,6 +103,41 @@ def _inside(b, x, y, tol=0.0):
     return b[0] - tol <= x <= b[2] + tol and b[1] - tol <= y <= b[3] + tol
 
 
+def _curve_frame(c, bbox):
+    """A four-corner axis-aligned rectangle drawn as one PDF path.
+
+    Many vector plots use a closed stroked path for the plot border instead of
+    a ``rect`` or four ``line`` objects.  Without recognising that path the
+    whole panel is rejected as "无坐标框" before its tick labels can be read.
+    """
+    if not c.get("stroke"):
+        return None
+    pts = [(float(x), float(y)) for x, y in (c.get("pts") or [])]
+    if len(pts) == 5 and abs(pts[0][0] - pts[-1][0]) <= 1 and \
+            abs(pts[0][1] - pts[-1][1]) <= 1:
+        pts = pts[:-1]
+    if len(pts) != 4:
+        return None
+    # Every edge must be horizontal or vertical, and the path must be closed.
+    for i, (p, q) in enumerate(zip(pts, pts[1:] + pts[:1])):
+        if abs(p[0] - q[0]) > 1.0 and abs(p[1] - q[1]) > 1.0:
+            return None
+        if i == 3 and not (abs(p[0] - q[0]) <= 1.0 or abs(p[1] - q[1]) <= 1.0):
+            return None
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    b = (min(xs), min(ys), max(xs), max(ys))
+    bw, bh = b[2] - b[0], b[3] - b[1]
+    if bw < .2 * (bbox[2] - bbox[0]) or bh < .15 * (bbox[3] - bbox[1]):
+        return None
+    if not all(_inside(bbox, x, y, 2.0) for x, y in pts):
+        return None
+    # Four real sides, not a small legend swatch or a marker glyph.
+    if bw < .45 * (bbox[2] - bbox[0]) or bh < .45 * (bbox[3] - bbox[1]):
+        return None
+    return b
+
+
 def find_axes_boxes(page, bbox):
     """Independent PDF plot frames; never calibrate their union as one coordinate system."""
     bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -125,6 +160,10 @@ def find_axes_boxes(page, bbox):
         for h in horizontal:
             if abs(l[0] - h[0]) <= 1 and abs(l[3] - h[1]) <= 1:
                 boxes.append((l[0], l[1], h[2], h[1]))
+    for c in getattr(page, "curves", ()):
+        frame = _curve_frame(c, bbox)
+        if frame is not None:
+            boxes.append(frame)
     unique = []
     for b in sorted(boxes, key=_bbox_area):
         if any(max(abs(x - y) for x, y in zip(b, k)) < 2 for k in unique):
@@ -150,6 +189,13 @@ def find_axes_box(page, bbox, min_frac=0.45):
            (b[3] - b[1]) >= min_frac * (bbox[3] - bbox[1]):
             if best is None or _bbox_area(b) > _bbox_area(best):
                 best = b
+    if best is None:
+        for c in getattr(page, "curves", ()):
+            frame = _curve_frame(c, bbox)
+            if frame is None:
+                continue
+            if best is None or _bbox_area(frame) > _bbox_area(best):
+                best = frame
     if best is not None:
         return [round(v, 2) for v in best]
     # fall back to the extent of the longest straight lines (two-axis charts do this
@@ -300,24 +346,38 @@ def _color_key(c):
     stroke_col = c.get("stroking_color")
     fill_col = c.get("non_stroking_color")
 
-    def chroma(col):
-        return (max(col) - min(col)) if isinstance(col, (list, tuple)) and len(col) == 3 else 0
+    def rgb(col):
+        if isinstance(col, (int, float)):
+            value = round(float(col), 2)
+            return (value, value, value)
+        if not isinstance(col, (list, tuple)):
+            return None
+        if len(col) == 1:
+            value = round(float(col[0]), 2)
+            return (value, value, value)
+        if len(col) == 3:
+            return tuple(round(float(v), 2) for v in col)
+        if len(col) == 4:
+            # PDFs commonly store process colours as CMYK.  In particular the
+            # red/blue series in vector figures may only appear as 4-tuples such
+            # as (0, .922, 1, 0); treating those as unknown loses every series.
+            c_, m_, y_, k_ = (float(v) for v in col)
+            return tuple(round(max(0.0, min(1.0, (1.0 - v) * (1.0 - k_))), 2)
+                         for v in (c_, m_, y_))
+        return None
 
+    def chroma(col):
+        value = rgb(col)
+        return (max(value) - min(value)) if value else 0
+
+    stroke_rgb, fill_rgb = rgb(stroke_col), rgb(fill_col)
     # Marker glyphs are often encoded as a coloured fill with either no stroke or a
     # black outline.  Using the dormant/outline stroking colour turns every red marker
     # into a fake black series, so choose the visible chromatic fill in that case.
-    if c.get("fill") and isinstance(fill_col, (list, tuple)) and len(fill_col) == 3 \
-            and (not c.get("stroke") or chroma(fill_col) > chroma(stroke_col)):
-        col = fill_col
-    else:
-        col = stroke_col if stroke_col is not None else fill_col
-    if isinstance(col,(int,float)):
-        return (round(float(col),2),)*3
-    if isinstance(col,(list,tuple)) and len(col)==1:
-        return (round(float(col[0]),2),)*3
-    if isinstance(col, (list, tuple)) and len(col) == 3:
-        return tuple(round(float(v), 2) for v in col)
-    return None
+    if c.get("fill") and fill_rgb is not None \
+            and (not c.get("stroke") or chroma(fill_rgb) > chroma(stroke_rgb)):
+        return fill_rgb
+    return stroke_rgb if stroke_rgb is not None else fill_rgb
 
 
 def _color_hex(color):
@@ -506,11 +566,14 @@ def _assign_specs(candidates, series_spec, image_bbox):
     ordered = []
     for spec_index, spec in enumerate(series_spec or []):
         skey = _hex_key(spec.get("color"))
+        draw = str(spec.get('draw') or '')
         ranked = []
         for i in unused:
             source = candidates[i]['source']
-            draw = str(spec.get('draw') or '')
-            if (draw in ('markers_only','markers_connected') and not source.startswith('markers:')) \
+            # markers_connected is a line chart with visible markers: use the
+            # dense PDF path when present, and fall back to the marker track
+            # only when no line path is available.
+            if (draw == 'markers_only' and not source.startswith('markers:')) \
                     or (draw == 'line_only' and source.startswith('markers:')):
                 continue
             shape = str(spec.get('marker_shape') or '')
@@ -530,6 +593,15 @@ def _assign_specs(candidates, series_spec, image_bbox):
         if not ranked:
             continue
         score, best = min(ranked)
+        # For "markers connected by a line", the marker-only track is sparse and
+        # loses the connecting path.  Prefer a nearby dense path of the same
+        # colour when one exists; fall back to markers only if no line matches.
+        if (draw == 'markers_connected'
+                and candidates[best]['source'].startswith('markers:')):
+            paths = [(sc, i) for sc, i in ranked
+                     if not candidates[i]['source'].startswith('markers:')]
+            if paths and min(paths)[0] <= score + 0.2:
+                score, best = min(paths)
         # A wildly distant anchor is not evidence for this path.  Keep the candidate
         # generic rather than giving it a confident but wrong legend name.
         if score > 0.32:

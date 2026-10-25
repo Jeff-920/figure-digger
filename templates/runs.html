@@ -121,6 +121,17 @@
                 <i class="fa-solid fa-download" aria-hidden="true"></i>
               </a>
               {% endif %}
+              {% if view.state.key not in ['queued', 'running'] %}
+              <form class="delete-form" method="post"
+                    action="{{ url_for('main.delete_run', run_id=view.run_id) }}"
+                    onsubmit="return confirm('删除任务 {{ view.short_id }}？任务目录、CSV、核对图和配置都会删除，且不可恢复。');">
+                <input type="hidden" name="next" value="{{ request.full_path }}">
+                <button class="icon-btn danger" type="submit"
+                        title="删除任务" aria-label="删除任务 {{ view.short_id }}">
+                  <i class="fa-solid fa-trash" aria-hidden="true"></i>
+                </button>
+              </form>
+              {% endif %}
             </div>
           </td>
         </tr>

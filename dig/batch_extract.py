@@ -246,7 +246,7 @@ def process_panel(image_path, rng, outdir, sat_min, val_min, hue_tol,
     }
 
 
-def _closed_rectangle(gray,box,min_cover=.92,max_gray=245,img=None):
+def _closed_rectangle(gray,box,min_cover=.92,max_gray=245,img=None,ink=None):
     x,y,w,h = map(int,box)
     if min(w,h)<4:
         return False
@@ -254,11 +254,12 @@ def _closed_rectangle(gray,box,min_cover=.92,max_gray=245,img=None):
     right,bottom = min(cols-1,x+w),min(rows-1,y+h)
     if x<0 or y<0 or x>=right or y>=bottom:
         return False
-    ink = gray<max_gray
-    if img is not None:
-        # Shaded uncertainty bands and coloured curves are not rectangular
-        # borders, even when their pixels happen to cover four candidate edges.
-        ink &= cv2.cvtColor(img,cv2.COLOR_BGR2HSV)[:,:,1]<65
+    if ink is None:
+        ink = gray<max_gray
+        if img is not None:
+            # Shaded uncertainty bands and coloured curves are not rectangular
+            # borders, even when their pixels happen to cover four candidate edges.
+            ink &= cv2.cvtColor(img,cv2.COLOR_BGR2HSV)[:,:,1]<65
     edges = [ink[max(0,y-1):min(rows,y+2),x:right+1].any(axis=0),
              ink[max(0,bottom-1):min(rows,bottom+2),x:right+1].any(axis=0),
              ink[y:bottom+1,max(0,x-1):min(cols,x+2)].any(axis=1),
@@ -289,19 +290,37 @@ def legend_boxes(img, frame, max_frac_w=0.75, max_frac_h=0.65):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
     left, top, right, bottom = frame
     fw, fh = max(1, right - left), max(1, bottom - top)
+    # Compute the full-image border mask once.  Recolouring the whole image (and
+    # re-thresholding it) for every candidate box made photo-heavy panels take
+    # minutes; a panel can easily produce hundreds of duplicate candidates.
+    ink = gray < 245
+    if img.ndim == 3:
+        ink &= cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[:, :, 1] < 65
     cands = []
-    for th in (120, 180, 225,245):
+    for th in (120, 180, 225, 245):
         cands += lc.find_boxes(gray, th)
-        cands += [(l,t,r-l,b-t) for l,t,r,b in
-                  el.find_boxes(gray,th,min_run_frac=.1,min_frac=.05,keep_nested=True)]
+        cands += [(l, t, r-l, b-t) for l, t, r, b in
+                  el.find_boxes(gray, th, min_run_frac=.1, min_frac=.05,
+                                keep_nested=True,
+                                max_checks=20000 if th >= 225 else 50000)]
+    # Four thresholds commonly return the same outline.  Deduplicate before the
+    # per-box pixel/contour work, then keep only reasonably sized candidates.
+    unique = {}
+    for x, y, w, h in cands:
+        if w < 12 or h < 10 or w > max_frac_w * fw or h > max_frac_h * fh:
+            continue
+        if not (x >= left-3 and y >= top-3
+                and x+w <= right+3 and y+h <= bottom+3):
+            continue
+        unique.setdefault((round(x/3), round(y/3), round(w/3), round(h/3)),
+                          (x, y, w, h))
     boxes = []
-    for (x, y, w, h) in cands:
-        if (not _closed_rectangle(gray,(x,y,w,h),img=img)
-                or _extended_rectangle_edges(gray,(x,y,w,h))>=2):
+    for (x, y, w, h) in unique.values():
+        if (not _closed_rectangle(gray, (x, y, w, h), img=img, ink=ink)
+                or _extended_rectangle_edges(gray, (x, y, w, h)) >= 2):
             continue
-        if not (x>=left-3 and y>=top-3 and x+w<=right+3 and y+h<=bottom+3):
-            continue
-        if w > max_frac_w * fw or h > max_frac_h * fh:
+        if not (x >= left-3 and y >= top-3
+                and x+w <= right+3 and y+h <= bottom+3):
             continue
         # Coloured zoom-reference frames can enclose real data and axis labels.
         # Their coloured border is not a legend's neutral rectangular outline.
@@ -352,9 +371,13 @@ def inner_boxes(gray, frame, max_frac=0.92, img=None):
     # 所以这里单独放宽到 15% 再筛"是不是在坐标框里面"。
     margin = max(5,int(.01*min(fw,fh)))
     for threshold in (120,180,225,245):
-        for l,t,r,b in el.find_boxes(gray,threshold,min_run_frac=.12,min_frac=.10,keep_nested=True):
+        for l,t,r,b in el.find_boxes(gray,threshold,min_run_frac=.12,min_frac=.10,
+                                     keep_nested=True,max_checks=20000):
             if l>=left+margin and t>=top+margin and r<=right-margin and b<=bottom-margin:
                 out.append((l,t,r-l,b-t))
+    ink180 = gray < 180
+    if img is not None and img.ndim == 3:
+        ink180 &= cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[:, :, 1] < 65
     for (x, y, w, h) in el.find_inner_boxes((gray < 120).astype(np.uint8) * 255):
         if (x>=left+margin and y>=top+margin and x+w<=right-margin and y+h<=bottom-margin
                 and w < max_frac * fw and h < max_frac * fh):
@@ -366,7 +389,7 @@ def inner_boxes(gray, frame, max_frac=0.92, img=None):
                    and abs(b[2] - k[2]) < 14 and abs(b[3] - k[3]) < 14 for k in legend)
 
     for b in sorted(out,key=lambda b:-b[2]*b[3]):
-        if (not _closed_rectangle(gray,b,max_gray=180,img=img)
+        if (not _closed_rectangle(gray,b,max_gray=180,img=img,ink=ink180)
                 or _extended_rectangle_edges(gray,b)>=2):
             continue
         if in_legend(b):

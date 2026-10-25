@@ -88,7 +88,8 @@ def rectangle_edge_extensions(gray, box, dark_thresh=245):
 
 
 @cached_detection
-def find_boxes(gray, dark_thresh=120, min_run_frac=0.4, min_frac=0.22, keep_nested=False):
+def find_boxes(gray, dark_thresh=120, min_run_frac=0.4, min_frac=0.22,
+               keep_nested=False, max_checks=200000):
     """Every rectangle whose four edges are long straight dark lines, largest first.
 
     The axes box, a legend frame and a zoom inset are all built from the same kind of
@@ -108,6 +109,7 @@ def find_boxes(gray, dark_thresh=120, min_run_frac=0.4, min_frac=0.22, keep_nest
     if len(rows) < 2 or len(cols) < 2:
         return []
     boxes = []
+    checks = 0
     for i, top in enumerate(rows):
         for bottom in rows[i + 1:]:
             if bottom - top < min_frac * h:
@@ -116,6 +118,13 @@ def find_boxes(gray, dark_thresh=120, min_run_frac=0.4, min_frac=0.22, keep_nest
                 for right in cols[k + 1:]:
                     if right - left < min_frac * w:
                         continue
+                    checks += 1
+                    if checks > max_checks:
+                        # Photo/mixed panels can produce hundreds of plausible
+                        # long runs; enumerating every rectangle is effectively
+                        # quadratic and used to freeze the batch for minutes.
+                        boxes.sort(key=lambda b: -((b[2] - b[0]) * (b[3] - b[1])))
+                        return boxes
                     if _box_edges_dark(dark, (left, top, right, bottom)):
                         boxes.append((left, top, right, bottom))
     boxes.sort(key=lambda b: -((b[2] - b[0]) * (b[3] - b[1])))

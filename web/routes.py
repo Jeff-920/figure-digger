@@ -15,7 +15,8 @@ from flask import (Blueprint, abort, current_app, flash, jsonify, redirect,
                    render_template, request, send_file, url_for)
 
 from ui_utils import (RunOptions, build_command, clear_saved_api_key,
-                      make_archive, save_api_key, valid_pages)
+                      load_ui_preferences, make_archive, save_api_key,
+                      save_ui_preferences, valid_pages)
 
 from .chart import build_panel_chart, save_panel_curves
 from .tasks import (LOG_PREVIEW_CHARS, MODE_LABELS, RunStore, TaskManager,
@@ -77,8 +78,10 @@ def _safe_next(default: str) -> str:
 
 
 def _default_form() -> dict:
+    preferences = load_ui_preferences(_store().workspace)
     return {
-        "want": "",
+        "want": str(preferences.get("want") or ""),
+        "figure": "",
         "mode": "auto",
         "pages": "",
         "dpi": "300",
@@ -99,6 +102,7 @@ def _form_from_request() -> dict:
     mode = form.get("mode") if form.get("mode") in {"auto", "analyze"} else "auto"
     return {
         "want": form.get("want", ""),
+        "figure": form.get("figure", "").strip(),
         "mode": mode,
         "pages": form.get("pages", "").strip(),
         "dpi": form.get("dpi", "300").strip(),
@@ -399,6 +403,16 @@ def create_run():
         errors.append("模板导出需要选择自动提取；仅分析不生成模板文件。")
 
     want = form["want"].strip()
+    if len(want) > 500:
+        errors.append("提取目标不能超过 500 个字符。")
+    figure = form["figure"].strip()
+    if figure:
+        if not figure.isdigit() or not 1 <= int(figure) <= 9999:
+            errors.append("Figure 编号必须是 1 到 9999 的整数。")
+        else:
+            # An exact figure number is a stronger selection signal than the
+            # free-text description; keep the resulting task metadata explicit.
+            want = f"Figure {int(figure)}"
     api_key = (request.form.get("api_key") or "").strip()
     if "\n" in api_key or "\r" in api_key:
         errors.append("API Key 不能包含换行。")
@@ -477,6 +491,12 @@ def create_run():
         shutil.rmtree(store.run_dir(run_id), ignore_errors=True)
         errors.append("无法保存任务信息，请检查 .ui_workspace 的写入权限。")
         return _render_new(form, errors, 500)
+
+    if not figure:
+        try:
+            save_ui_preferences(store.workspace, want=want)
+        except OSError:
+            pass
 
     try:
         _tasks().submit(run_id, command, api_key)
@@ -692,6 +712,27 @@ def download_artifact(run_id: str, artifact_path: str):
         abort(404)
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@bp.post("/runs/<run_id>/delete")
+def delete_run(run_id: str):
+    store = _store()
+    try:
+        view = build_run_view(store, run_id)
+    except ValueError:
+        abort(404)
+    if view is None:
+        abort(404)
+    if view.state.key in {"queued", "running"}:
+        flash("任务仍在运行或排队，不能删除；请先等待结束或停止服务。", "warning")
+        return redirect(_safe_next(url_for("main.index")), code=303)
+    try:
+        shutil.rmtree(store.run_dir(run_id))
+    except OSError:
+        flash("删除失败，请检查 .ui_workspace 的写入权限。", "danger")
+    else:
+        flash(f"已删除任务 {view.short_id}。", "success")
+    return redirect(_safe_next(url_for("main.index")), code=303)
 
 
 @bp.get("/runs/<run_id>/archive.zip")

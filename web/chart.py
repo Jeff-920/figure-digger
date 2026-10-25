@@ -36,6 +36,16 @@ def _range(value, fallback=None) -> list[float] | None:
     return None
 
 
+def _axis_values(value) -> list[float] | None:
+    if isinstance(value, dict):
+        x = _range(value.get("x"))
+        y = _range(value.get("y"))
+        if x is None or y is None:
+            return None
+        return [x[0], x[1], y[0], y[1]]
+    return _range(value)
+
+
 def _frame(value) -> list[float] | None:
     if not isinstance(value, (list, tuple)) or len(value) < 4:
         return None
@@ -111,14 +121,29 @@ def _axis_labels(paper_root: Path, panel_id: str, record: dict) -> tuple[str, st
     return fallback
 
 
-def _image_path(paper_root: Path, record: dict) -> Path | None:
-    name = record.get("panel")
-    if not isinstance(name, str) or not name.strip():
-        return None
-    base = Path(name).name
-    for candidate in (paper_root / "panels" / base, paper_root / "figures" / base):
-        if candidate.is_file() and _inside(candidate, paper_root):
-            return candidate
+def _panel_config(paper_root: Path, panel_id: str) -> dict:
+    for config_path in paper_root.glob("*_config.json"):
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for panel in config.get("panels", []) if isinstance(config, dict) else []:
+            if isinstance(panel, dict) and panel.get("id") == panel_id:
+                return panel
+    return {}
+
+
+def _image_path(paper_root: Path, record: dict, panel_id: str) -> Path | None:
+    names = []
+    if isinstance(record.get("panel"), str) and record["panel"].strip():
+        names.append(Path(record["panel"]).name)
+    # Older vector results did not persist the crop filename.  The crop is
+    # deterministic and is also what the verify image was rendered from.
+    names.append(f"{panel_id}.png")
+    for base in dict.fromkeys(names):
+        for candidate in (paper_root / "panels" / base, paper_root / "figures" / base):
+            if candidate.is_file() and _inside(candidate, paper_root):
+                return candidate
     return None
 
 
@@ -150,14 +175,12 @@ def build_panel_chart(verify_path: Path) -> dict | None:
         return None
 
     frame = _frame(record.get("frame"))
-    axis = _range(record.get("axis_range"))
-    image_path = _image_path(paper_root, record)
+    axis = _axis_values(record.get("axis_range"))
+    image_path = _image_path(paper_root, record, panel_id)
     if frame is None or axis is None or image_path is None:
         return None
-    x_range = _range((record.get("axis_range") or [])[:2])
-    y_default = _range((record.get("axis_range") or [])[2:4])
-    if x_range is None or y_default is None:
-        return None
+    x_range = axis[:2]
+    y_default = axis[2:4]
 
     try:
         from PIL import Image
@@ -168,6 +191,27 @@ def build_panel_chart(verify_path: Path) -> dict | None:
         image_bytes = image_path.read_bytes()
     except (OSError, ValueError):
         return None
+
+    # Vector output used to store the frame in PDF points while the editable
+    # image is the cropped 300-DPI figure.  Convert it to image pixels so the
+    # existing point editor can map CSV values back onto the raster.
+    if record.get("method") == "vector" and record.get("frame_space") != "pixels":
+        panel = _panel_config(paper_root, panel_id)
+        bbox = panel.get("vector_bbox")
+        if (isinstance(bbox, (list, tuple)) and len(bbox) == 4
+                and bbox[2] > bbox[0] and bbox[3] > bbox[1]):
+            sx = width / float(bbox[2] - bbox[0])
+            sy = height / float(bbox[3] - bbox[1])
+            frame = ((frame[0] - bbox[0]) * sx, (frame[1] - bbox[1]) * sy,
+                     (frame[2] - bbox[0]) * sx, (frame[3] - bbox[1]) * sy)
+        else:
+            return None
+        frame = [max(0.0, min(float(width), frame[0])),
+                 max(0.0, min(float(height), frame[1])),
+                 max(0.0, min(float(width), frame[2])),
+                 max(0.0, min(float(height), frame[3]))]
+        if frame[2] <= frame[0] or frame[3] <= frame[1]:
+            return None
     mime = "image/jpeg" if image_format in {"JPEG", "JPG"} else "image/png"
     data_uri = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
 

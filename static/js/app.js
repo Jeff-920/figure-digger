@@ -30,6 +30,7 @@
     const pdfInput = document.getElementById("pdfs");
     const fileList = document.getElementById("pdf-file-list");
     const wantInput = document.getElementById("want");
+    const figureInput = document.getElementById("figure");
     const pagesInput = document.getElementById("pages");
     const dpiInput = document.getElementById("dpi");
     const summaryFiles = document.getElementById("summary-files");
@@ -41,6 +42,34 @@
     const infoError = document.getElementById("pdf-info-error");
     let infoAbort = null;
     let infoToken = 0;
+    let selectedFiles = [];
+
+    const fileKey = (file) => `${file.name}|${file.size}|${file.lastModified}`;
+
+    const syncFileInput = () => {
+      if (!pdfInput) return;
+      try {
+        const transfer = new DataTransfer();
+        selectedFiles.forEach((file) => transfer.items.add(file));
+        pdfInput.files = transfer.files;
+      } catch (error) {
+        // Older browsers cannot construct DataTransfer.  Keep the browser's
+        // current selection rather than silently dropping files.
+        console.warn("无法合并多次选择的文件", error);
+      }
+    };
+
+    const addFiles = (incoming) => {
+      const keys = new Set(selectedFiles.map(fileKey));
+      incoming.forEach((file) => {
+        const key = fileKey(file);
+        if (!keys.has(key)) {
+          keys.add(key);
+          selectedFiles.push(file);
+        }
+      });
+      syncFileInput();
+    };
 
     const mode = () => {
       const checked = form.querySelector('input[name="mode"]:checked');
@@ -112,7 +141,7 @@
 
     const renderFiles = () => {
       if (!fileList || !pdfInput) return;
-      const files = Array.from(pdfInput.files || []);
+      const files = selectedFiles;
       fileList.replaceChildren();
       if (infoError) infoError.textContent = "";
       if (!files.length) {
@@ -134,6 +163,7 @@
         const name = document.createElement("span");
         name.className = "file-name";
         name.textContent = file.name;
+        name.title = file.name;
 
         const pages = document.createElement("span");
         pages.className = "file-pages";
@@ -143,14 +173,30 @@
         size.className = "file-size";
         size.textContent = formatBytes(file.size);
 
-        row.append(icon, name, pages, size);
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "file-remove";
+        remove.setAttribute("aria-label", `移除 ${file.name}`);
+        remove.title = "移除此文件";
+        const removeIcon = document.createElement("i");
+        removeIcon.className = "fa-solid fa-xmark";
+        removeIcon.setAttribute("aria-hidden", "true");
+        remove.appendChild(removeIcon);
+        remove.addEventListener("click", () => {
+          selectedFiles.splice(index, 1);
+          syncFileInput();
+          renderFiles();
+          updateSummary();
+        });
+
+        row.append(icon, name, pages, size, remove);
         fileList.appendChild(row);
       });
       loadPageCounts(files);
     };
 
     const updateSummary = () => {
-      const files = Array.from(pdfInput ? pdfInput.files || [] : []);
+      const files = selectedFiles;
       const totalSize = files.reduce((sum, file) => sum + file.size, 0);
       if (summaryFiles) {
         summaryFiles.textContent = files.length
@@ -164,8 +210,9 @@
         summaryDpi.textContent = `${dpiInput ? dpiInput.value : "300"} DPI`;
       }
       if (summaryWant) {
+        const figure = figureInput ? figureInput.value.trim() : "";
         const text = wantInput ? wantInput.value.trim() : "";
-        summaryWant.textContent = text || "全部数据图";
+        summaryWant.textContent = figure ? `Figure ${figure}` : (text || "全部数据图");
       }
       if (summaryPages) {
         summaryPages.textContent = pagesInput && pagesInput.value.trim()
@@ -175,11 +222,16 @@
 
     form.addEventListener("change", (event) => {
       syncControls();
-      if (event.target === pdfInput) renderFiles();
+      if (event.target === pdfInput) {
+        const incoming = Array.from(pdfInput.files || []);
+        if (incoming.length) addFiles(incoming);
+        renderFiles();
+      }
       updateSummary();
     });
     form.addEventListener("input", (event) => {
-      if (event.target === wantInput || event.target === pagesInput) {
+      if (event.target === wantInput || event.target === figureInput
+          || event.target === pagesInput) {
         updateSummary();
       }
     });

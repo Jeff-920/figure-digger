@@ -34,8 +34,8 @@ python app.py</pre>
     <section class="surface help-card">
       <h2><i class="fa-solid fa-list-check" aria-hidden="true"></i> 提取流程</h2>
       <ol class="help-list">
-        <li>在“开始提取”上传一篇或多篇 PDF，可再上传 <code>.txt</code>、<code>.dat</code> 或 <code>.csv</code> 模板。</li>
-        <li>填写图号或目标描述。留空会处理检测到的全部数据图；按内容、工况或子图条件找图由视觉模型完成。</li>
+        <li>在“开始提取”上传一篇或多篇 PDF；可一次多选，也可分多次从不同目录添加，列表右侧可移除。可再上传 <code>.txt</code>、<code>.dat</code> 或 <code>.csv</code> 模板。</li>
+        <li>已知 Figure 编号可在“已知 Figure 编号”直接填数字，优先按图号定位；否则填写目标描述。两者都留空会处理检测到的全部数据图。提交后会记住本次描述，下次新建预填，修改后以新内容为准。</li>
         <li>选择“自动提取”或“仅分析，稍后确认坐标”。所有提取任务都使用视觉模型。</li>
         <li>按需展开“更多设置”填写页码、DPI、批量并行数；页码使用 PDF 实际页序，从 1 开始，格式如 <code>3,5,7</code>。</li>
         <li>提交后任务在后台运行。可以离开新建页，在“任务结果”中查看进度和日志。</li>

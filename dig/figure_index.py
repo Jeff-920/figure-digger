@@ -58,13 +58,19 @@ def _overlap_x(a, b):
     return max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
 
 
-def _touching(a, b, gap=8.0):
-    """Two boxes that belong to one figure split into stacked/side-by-side pieces."""
+def _touching(a, b, gap=8.0, stack_gap=60.0):
+    """Two boxes that belong to one figure split into stacked/side-by-side pieces.
+
+    Vertically stacked chart panels often have a real gutter (tick labels and
+    the upper panel's x title) while still sharing one caption below the lower
+    panel.  Side-by-side panels are only merged when truly adjacent, otherwise
+    two columns from different figures could inherit each other's caption.
+    """
     dx = max(a[0], b[0]) - min(a[2], b[2])      # >0 when separated horizontally
     dy = max(a[1], b[1]) - min(a[3], b[3])      # >0 when separated vertically
     overlap_x = _overlap_x(a, b)
     overlap_y = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
-    stacked = overlap_x >= 0.6 * min(a[2] - a[0], b[2] - b[0]) and dy <= gap
+    stacked = overlap_x >= 0.6 * min(a[2] - a[0], b[2] - b[0]) and dy <= stack_gap
     side_by_side = overlap_y >= 0.6 * min(a[3] - a[1], b[3] - b[1]) and dx <= gap
     return stacked or side_by_side
 

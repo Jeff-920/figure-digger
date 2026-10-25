@@ -9,9 +9,9 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from ui_utils import (RunOptions, build_command, collect_artifacts, make_archive,
-                      safe_filename, valid_pages, save_api_key,
-                      clear_saved_api_key)
+from ui_utils import (RunOptions, build_command, collect_artifacts, load_ui_preferences,
+                      make_archive, safe_filename, valid_pages, save_api_key,
+                      clear_saved_api_key, save_ui_preferences)
 
 
 class UiUtilsTests(unittest.TestCase):
@@ -38,6 +38,17 @@ class UiUtilsTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     save_api_key(root, value)
             self.assertEqual((root / "deepseek_key.txt").read_text().strip(), "test-existing-key")
+
+    def test_ui_preferences_roundtrip_and_corrupt_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.assertEqual(load_ui_preferences(root), {})
+            save_ui_preferences(root, want="Figure 5")
+            self.assertEqual(load_ui_preferences(root)["want"], "Figure 5")
+            save_ui_preferences(root, want="")
+            self.assertEqual(load_ui_preferences(root)["want"], "")
+            (root / ".ui-preferences.json").write_text("{bad", encoding="utf-8")
+            self.assertEqual(load_ui_preferences(root), {})
 
     def test_safe_filename_removes_paths_and_shell_punctuation(self):
         self.assertEqual(safe_filename("../../paper; rm.pdf"), "paper_rm.pdf")
